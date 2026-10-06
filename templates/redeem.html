@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Redeem Code{% endblock %}
+{% block content %}
+<a href="{{ url_for('dashboard') }}" class="back-link">&larr; Back to Dashboard</a>
+
+<div class="card auth-card">
+  <h2>🎟 Redeem Code</h2>
+  <p class="muted">Enter a code from the admin to unlock or extend your access.</p>
+  <form method="post">
+    <label>Redeem Code</label>
+    <input type="text" name="code" placeholder="SMP-XXXX-XXXX-XXXX" required autofocus style="text-transform:uppercase;">
+    <button type="submit" class="btn btn-primary">Redeem</button>
+  </form>
+</div>
+{% endblock %}

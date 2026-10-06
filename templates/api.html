@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}API{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>🔌 API Access</h2>
+  <p class="muted">Create an API key and use Session Manager Pro from your own bot or application.</p>
+  {% if new_key %}
+    <div class="flash flash-success"><b>New API key — copy it now:</b><br><code>{{ new_key }}</code><br><span class="muted">For security, the full key is shown only once.</span></div>
+  {% endif %}
+  <form method="post" action="{{ url_for('api_generate_key') }}">
+    <button class="btn btn-primary">Generate API Key</button>
+  </form>
+</div>
+<div class="card">
+  <h3>Your API Keys</h3>
+  {% if keys %}<table class="table"><tr><th>Key</th><th>Created</th><th>Last Used</th><th></th></tr>
+  {% for k in keys %}<tr><td><code>{{ k['key_prefix'] }}••••••</code></td><td>{{ k['created_at'] }}</td><td>{{ k['last_used_at'] or 'Never' }}</td><td>{% if not k['revoked_at'] %}<form method="post" action="{{ url_for('api_revoke_key', key_id=k['id']) }}"><button class="btn btn-small btn-danger">Revoke</button></form>{% else %}<span class="badge badge-bad">Revoked</span>{% endif %}</td></tr>{% endfor %}</table>
+  {% else %}<p class="muted">No API keys yet.</p>{% endif %}
+</div>
+<div class="card">
+  <h2>📚 API Documentation</h2>
+  <p>Base URL: <code>{{ request.url_root.rstrip('/') }}</code></p>
+  <h3>Authentication</h3><pre>Authorization: Bearer YOUR_API_KEY</pre>
+  <h3>GET /api/v1/me</h3><p>Returns the authenticated user's account and session count.</p>
+  <h3>GET /api/v1/sessions</h3><p>Lists sessions belonging to the API-key owner.</p>
+  <h3>GET /api/v1/sessions/&lt;session_id&gt;/2fa</h3><p>Checks Telegram 2FA status.</p>
+  <h3>POST /api/v1/sessions/&lt;session_id&gt;/2fa/reset</h3><p>Starts Telegram's official 2FA password reset flow. It does <b>not</b> reset or delete the Telegram account. Telegram may require recovery email confirmation or a waiting period.</p>
+  <h3>cURL</h3><pre>curl -H "Authorization: Bearer YOUR_API_KEY" \
+  {{ request.url_root.rstrip('/') }}/api/v1/sessions/1/2fa
+
+curl -X POST -H "Authorization: Bearer YOUR_API_KEY" \
+  {{ request.url_root.rstrip('/') }}/api/v1/sessions/1/2fa/reset</pre>
+  <h3>Python</h3><pre>import requests
+
+BASE = "{{ request.url_root.rstrip('/') }}"
+HEADERS = {"Authorization": "Bearer YOUR_API_KEY"}
+r = requests.post(f"{BASE}/api/v1/sessions/1/2fa/reset", headers=HEADERS)
+print(r.json())</pre>
+</div>
+{% endblock %}
