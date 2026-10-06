@@ -1,0 +1,206 @@
+{% extends "base.html" %}
+{% block title %}{{ s['name'] }}{% endblock %}
+{% block content %}
+
+<a href="{{ url_for('dashboard') }}" class="back-link">&larr; Back to Dashboard</a>
+
+<div class="card">
+  <h2>⚙️ {{ s['name'] }}</h2>
+  <p class="muted">+{{ s['phone'] }} &middot; added {{ s['created_at'] }}</p>
+</div>
+
+<div class="grid">
+
+  <div class="card">
+    <h3>📩 Get OTP</h3>
+    <button class="btn btn-primary" onclick="fetchOtp()">Fetch Latest Code</button>
+    <div id="otp-result" class="result-box"></div>
+  </div>
+
+  <div class="card">
+    <h3>📨 Give Message</h3>
+    <p class="muted">Live-forward every new message this account receives on Telegram.</p>
+    <button id="give-toggle-btn" class="btn {{ 'btn-danger' if giving else 'btn-primary' }}" onclick="toggleGiveMessage()">
+      {{ 'Stop' if giving else 'Start' }} Live Feed
+    </button>
+    <div id="give-feed" class="feed-box"></div>
+  </div>
+
+  <div class="card">
+    <h3>📱 Devices</h3>
+    <button class="btn btn-secondary" onclick="loadDevices()">List Devices</button>
+    <button class="btn btn-danger" onclick="logoutAllOthers()">Logout All Other Devices</button>
+    <div id="devices-result" class="result-box"></div>
+  </div>
+
+  <div class="card">
+    <h3>🔐 2FA Status</h3>
+    <button class="btn btn-secondary" onclick="check2fa()">Check Status</button>
+    <button class="btn btn-danger" onclick="reset2fa()">Reset 2FA</button>
+    <div id="tfa-result" class="result-box"></div>
+  </div>
+
+  <div class="card">
+    <h3>🧹 Clean Account</h3>
+    <p class="muted">Leaves all channels/groups, deletes chats & contacts, unblocks everyone, resets name/username.</p>
+    <button class="btn btn-danger" onclick="cleanAccount()">Clean This Account</button>
+    <div id="clean-result" class="result-box"></div>
+  </div>
+
+  <div class="card">
+    <h3>🖼 Change Profile Photo</h3>
+    <form id="dp-form" onsubmit="return changeDp(event)">
+      <input type="file" name="photo" id="dp-file" accept="image/*" required>
+      <button type="submit" class="btn btn-primary">Upload</button>
+    </form>
+    <div id="dp-result" class="result-box"></div>
+  </div>
+
+  <div class="card">
+    <h3>📤 Session String</h3>
+    <button class="btn btn-secondary" onclick="showString()">Reveal</button>
+    <div id="string-result" class="result-box"></div>
+  </div>
+
+  <div class="card danger-zone">
+    <h3>⚠️ Danger Zone</h3>
+    <form method="post" action="{{ url_for('session_remove_only', session_id=s['id']) }}" onsubmit="return confirm('Remove from the site only? The Telegram account stays logged in.');">
+      <button type="submit" class="btn btn-secondary">Remove From Site Only</button>
+    </form>
+    <form method="post" action="{{ url_for('session_logout_delete', session_id=s['id']) }}" onsubmit="return confirm('This will log the account OUT of Telegram entirely. Continue?');">
+      <button type="submit" class="btn btn-danger">Logout &amp; Remove</button>
+    </form>
+  </div>
+
+</div>
+
+<script>
+const SID = {{ s['id'] }};
+
+async function fetchOtp() {
+  const box = document.getElementById('otp-result');
+  box.textContent = 'Fetching...';
+  const r = await fetch(`/sessions/${SID}/otp`);
+  const d = await r.json();
+  box.textContent = d.ok ? `Code: ${d.code}\n\n${d.full}` : `Error: ${d.error}`;
+}
+
+async function loadDevices() {
+  const box = document.getElementById('devices-result');
+  box.textContent = 'Loading...';
+  const r = await fetch(`/sessions/${SID}/devices`);
+  const d = await r.json();
+  if (!d.ok) { box.textContent = `Error: ${d.error}`; return; }
+  box.innerHTML = '';
+  d.devices.forEach(dev => {
+    const row = document.createElement('div');
+    row.className = 'device-row';
+    row.innerHTML = `<b>${dev.current ? '🔒' : '📱'} ${dev.device_model} (${dev.platform})</b>
+      <br><span class="muted">${dev.app_name} v${dev.app_version} &middot; IP ${dev.ip} &middot; ${dev.country} &middot; active ${dev.date_active}</span>`;
+    if (!dev.current) {
+      const btn = document.createElement('button');
+      btn.className = 'btn btn-small btn-danger';
+      btn.textContent = 'Logout';
+      btn.onclick = async () => {
+        const rr = await fetch(`/sessions/${SID}/devices/${dev.hash}/logout`, {method: 'POST'});
+        const dd = await rr.json();
+        if (dd.ok) loadDevices(); else alert(dd.error);
+      };
+      row.appendChild(btn);
+    }
+    box.appendChild(row);
+  });
+}
+
+async function logoutAllOthers() {
+  if (!confirm('Logout every other device on this account?')) return;
+  const box = document.getElementById('devices-result');
+  const r = await fetch(`/sessions/${SID}/logout_all_others`, {method: 'POST'});
+  const d = await r.json();
+  box.textContent = d.ok ? `Logged out ${d.count} other device(s).` : `Error: ${d.error}`;
+}
+
+async function reset2fa() {
+  if (!confirm('This starts Telegram’s official 2FA password reset. It does NOT reset/delete the Telegram account. Continue?')) return;
+  const box = document.getElementById('tfa-result'); box.textContent = 'Starting reset...';
+  const r = await fetch(`/sessions/${SID}/2fa/reset`, {method: 'POST'});
+  const d = await r.json();
+  box.textContent = d.ok ? `${d.result.message}\n\n${JSON.stringify(d.result, null, 2)}` : `Error: ${d.error}`;
+}
+
+async function check2fa() {
+  const box = document.getElementById('tfa-result');
+  box.textContent = 'Checking...';
+  const r = await fetch(`/sessions/${SID}/2fa`);
+  const d = await r.json();
+  box.textContent = d.ok ? (d.enabled ? `Enabled (hint: ${d.hint || 'none'})` : 'Disabled') : `Error: ${d.error}`;
+}
+
+async function cleanAccount() {
+  if (!confirm('This will leave channels/groups, delete chats & contacts, and reset the name. Continue?')) return;
+  const box = document.getElementById('clean-result');
+  box.textContent = 'Cleaning... this may take a moment.';
+  const r = await fetch(`/sessions/${SID}/clean`, {method: 'POST'});
+  const d = await r.json();
+  box.textContent = d.ok ? JSON.stringify(d.result, null, 2) : `Error: ${d.error}`;
+}
+
+async function changeDp(e) {
+  e.preventDefault();
+  const box = document.getElementById('dp-result');
+  const file = document.getElementById('dp-file').files[0];
+  if (!file) return false;
+  const fd = new FormData();
+  fd.append('photo', file);
+  box.textContent = 'Uploading...';
+  const r = await fetch(`/sessions/${SID}/change_dp`, {method: 'POST', body: fd});
+  const d = await r.json();
+  box.textContent = d.ok ? 'Profile photo updated.' : `Error: ${d.error}`;
+  return false;
+}
+
+async function showString() {
+  const box = document.getElementById('string-result');
+  const r = await fetch(`/sessions/${SID}/string`);
+  const d = await r.json();
+  box.textContent = d.ok ? d.session_string : `Error: ${d.error}`;
+}
+
+let evtSource = null;
+function startFeed() {
+  if (evtSource) return;
+  evtSource = new EventSource(`/sessions/${SID}/give_message/stream`);
+  const feed = document.getElementById('give-feed');
+  evtSource.onmessage = (ev) => {
+    const d = JSON.parse(ev.data);
+    const line = document.createElement('div');
+    line.className = 'feed-line';
+    line.innerHTML = `<b>${d.from}:</b> ${d.text}`;
+    feed.prepend(line);
+  };
+  evtSource.addEventListener('stopped', () => { stopFeedLocal(); });
+}
+function stopFeedLocal() {
+  if (evtSource) { evtSource.close(); evtSource = null; }
+}
+
+async function toggleGiveMessage() {
+  const btn = document.getElementById('give-toggle-btn');
+  const r = await fetch(`/sessions/${SID}/give_message/toggle`, {method: 'POST'});
+  const d = await r.json();
+  if (!d.ok) { alert(d.error); return; }
+  if (d.active) {
+    btn.textContent = 'Stop Live Feed';
+    btn.classList.add('btn-danger'); btn.classList.remove('btn-primary');
+    startFeed();
+  } else {
+    btn.textContent = 'Start Live Feed';
+    btn.classList.remove('btn-danger'); btn.classList.add('btn-primary');
+    stopFeedLocal();
+  }
+}
+
+{% if giving %}startFeed();{% endif %}
+</script>
+
+{% endblock %}
