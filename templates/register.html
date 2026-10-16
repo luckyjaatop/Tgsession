@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Register{% endblock %}
+{% block content %}
+<div class="card auth-card">
+  <h2>Create Account</h2>
+  <form method="post">
+    <!-- Honeypot: hidden from real users, left unfilled. A bot that fills
+         every field in the form trips this and the signup is silently
+         dropped server-side. autocomplete=off + tabindex=-1 keep browsers
+         and keyboard users from ever landing on it. -->
+    <div style="position:absolute;left:-9999px;top:-9999px;" aria-hidden="true">
+      <label for="website">Leave this field blank</label>
+      <input type="text" id="website" name="website" tabindex="-1" autocomplete="off">
+    </div>
+    <label>Username</label>
+    <input type="text" name="username" required autofocus>
+    <label>Password</label>
+    <input type="password" name="password" required minlength="6">
+    <button type="submit" class="btn btn-primary">Register</button>
+  </form>
+  <p class="muted">New accounts get a 1-hour free trial (1 session). <a href="{{ url_for('login') }}">Already have an account?</a></p>
+</div>
+{% endblock %}

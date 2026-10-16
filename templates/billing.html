@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Billing{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>⚡ Billing &amp; Plans</h2>
+  {% if access_ok %}
+    <p class="muted">Your account currently has active access
+      {% if current_user['access'] == 'premium' and current_user['premium_expires'] %}
+        — premium until <b>{{ current_user['premium_expires'] }}</b>.
+      {% elif current_user['access'] == 'premium' %}
+        — premium (no expiry).
+      {% elif current_user['access'] == 'trial' %}
+        — free trial until <b>{{ current_user['trial_expires'] }}</b>.
+      {% endif %}
+    </p>
+  {% else %}
+    <p class="muted">Your access has expired. Pick a plan below to continue.</p>
+  {% endif %}
+
+  <div class="plans-grid">
+    {% for pid, p in plans.items() %}
+      <div class="plan-card {% if p.get('featured') %}featured{% endif %}">
+        {% if p.get('featured') %}<div class="plan-badge">POPULAR</div>{% endif %}
+        <div class="plan-days">{{ p.label }}</div>
+        <div class="plan-price">₹{{ p.amount|int }}</div>
+        <form method="post" action="{{ url_for('billing_buy', plan_id=pid) }}">
+          <button class="btn btn-primary">Pay via UPI</button>
+        </form>
+      </div>
+    {% endfor %}
+  </div>
+</div>
+
+<div class="card order-history">
+  <h3>Order History</h3>
+  {% if orders %}
+    <table class="table">
+      <tr><th>Plan</th><th>Amount</th><th>Status</th><th>Date</th></tr>
+      {% for o in orders %}
+        <tr>
+          <td>{{ plans.get(o['plan_id'], {}).get('label', o['plan_id']) }}</td>
+          <td>₹{{ o['amount']|int }}</td>
+          <td>
+            {% if o['status'] == 'paid' %}<span class="badge badge-ok">Paid</span>
+            {% elif o['status'] == 'expired' %}<span class="badge badge-bad">Expired</span>
+            {% else %}<span class="badge">Pending</span>{% endif %}
+          </td>
+          <td>{{ o['created_at'] }}</td>
+        </tr>
+      {% endfor %}
+    </table>
+  {% else %}
+    <p class="muted">No orders yet.</p>
+  {% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}API{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>🔌 API Access</h2>
+  <p class="muted">Use Session Manager Pro from your own bot, app, or script. One key per account — generating a new one instantly kills the old one, and the key locks to the first device/network that uses it.</p>
+
+  {% if new_key %}
+    <div class="flash flash-success">
+      <b>New API key — copy it now, it won't be shown again:</b>
+      <div class="key-copy-row">
+        <code id="newKeyText">{{ new_key }}</code>
+        <button type="button" class="btn btn-small" onclick="copyApiKey()">📋 Copy</button>
+      </div>
+      <span id="copyStatus" class="muted" style="display:none;">Copied ✓</span>
+    </div>
+  {% endif %}
+
+  <form method="post" action="{{ url_for('api_generate_key') }}" onsubmit="return confirm('{% if keys %}This replaces your current key — anything using the old one will stop working. Continue?{% else %}Generate a new API key?{% endif %}');">
+    <button class="btn btn-primary">{% if keys %}Regenerate API Key{% else %}Generate API Key{% endif %}</button>
+  </form>
+</div>
+
+<div class="card">
+  <h3>Your Key</h3>
+  {% if keys %}
+    {% for k in keys %}
+      <div class="key-card">
+        <div class="key-card-row"><span class="muted">Key</span><code>{{ k['key_prefix'] }}••••••</code></div>
+        <div class="key-card-row"><span class="muted">Created</span>{{ k['created_at'] }}</div>
+        <div class="key-card-row"><span class="muted">Last used</span>{{ k['last_used_at'] or 'Never' }}</div>
+        <div class="key-card-row">
+          <span class="muted">Device lock</span>
+          {% if k['revoked_at'] %}
+            <span class="badge badge-bad">Revoked</span>
+          {% elif k['bound_ip'] %}
+            <span class="badge badge-bad">🔒 Locked</span>
+          {% else %}
+            <span class="badge badge-ok">🔓 Not yet locked</span>
+          {% endif %}
+        </div>
+        {% if not k['revoked_at'] %}
+        <div class="key-card-actions">
+          <form method="post" action="{{ url_for('api_reset_device') }}">
+            <button class="btn btn-small btn-outline">Reset Device Binding</button>
+          </form>
+          <form method="post" action="{{ url_for('api_revoke_key', key_id=k['id']) }}" onsubmit="return confirm('Revoke this key? Anything using it will stop working.');">
+            <button class="btn btn-small btn-danger">Revoke</button>
+          </form>
+        </div>
+        {% endif %}
+      </div>
+    {% endfor %}
+  {% else %}
+    <p class="muted">No API key yet — generate one above.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>📚 API Documentation</h2>
+  <p>Base URL: <code>{{ request.url_root.rstrip('/') }}</code></p>
+  <h3>Authentication</h3><pre>Authorization: Bearer YOUR_API_KEY</pre>
+  <h3>GET /api/v1/me</h3><p>Returns the authenticated user's account and session count.</p>
+  <h3>GET /api/v1/sessions</h3><p>Lists sessions belonging to the API-key owner.</p>
+  <h3>GET /api/v1/sessions/&lt;session_id&gt;/2fa</h3><p>Checks Telegram 2FA status.</p>
+  <h3>POST /api/v1/sessions/&lt;session_id&gt;/2fa/reset</h3><p>Starts Telegram's official 2FA password reset flow. It does <b>not</b> reset or delete the Telegram account. Telegram may require recovery email confirmation or a waiting period.</p>
+  <p class="muted">Plus dialogs, messages, devices, send-message, and more — ask in-app or check the latest endpoint list if you're integrating something specific.</p>
+  <h3>cURL</h3><pre>curl -H "Authorization: Bearer YOUR_API_KEY" \
+  {{ request.url_root.rstrip('/') }}/api/v1/sessions/1/2fa
+
+curl -X POST -H "Authorization: Bearer YOUR_API_KEY" \
+  {{ request.url_root.rstrip('/') }}/api/v1/sessions/1/2fa/reset</pre>
+  <h3>Python</h3><pre>import requests
+
+BASE = "{{ request.url_root.rstrip('/') }}"
+HEADERS = {"Authorization": "Bearer YOUR_API_KEY"}
+r = requests.post(f"{BASE}/api/v1/sessions/1/2fa/reset", headers=HEADERS)
+print(r.json())</pre>
+</div>
+
+<script>
+function copyApiKey() {
+  const text = document.getElementById('newKeyText').innerText;
+  navigator.clipboard.writeText(text).then(() => {
+    const s = document.getElementById('copyStatus');
+    s.style.display = 'inline';
+    setTimeout(() => { s.style.display = 'none'; }, 2000);
+  });
+}
+</script>
+{% endblock %}
