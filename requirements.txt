@@ -1,0 +1,6 @@
+flask
+telethon
+werkzeug
+pymongo
+dnspython
+requests
