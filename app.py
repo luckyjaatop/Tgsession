@@ -1032,7 +1032,12 @@ def api_send_message(session_id):
     target = int(peer_id) if peer_id else username
     try:
         result = tg_core.send_message(row, target, text)
-        return jsonify({"ok": True, "result": result})
+        return jsonify({
+            "ok": True,
+            "result": result,
+            "message_id": result.get("message_id"),
+            "message": result.get("message"),
+        })
     except PermissionError as e:
         return jsonify({"ok": False, "error": str(e), "code": "SEND_NOT_ALLOWED"}), 403
     except Exception as e:
@@ -1124,7 +1129,8 @@ def api_messages(session_id):
     # transient CancelledError to the UI.
     for attempt in range(3):
         try:
-            return jsonify({"ok": True, "messages": tg_core.get_messages(row, peer, limit=50)})
+            bundle = tg_core.get_messages_bundle(row, peer, limit=50)
+            return jsonify({"ok": True, "messages": bundle["messages"], "peer": bundle["peer"]})
         except Exception as e:
             last_error = e
             if attempt < 2:
@@ -1361,13 +1367,46 @@ def api_join(session_id):
     row = api_owned_session(u, session_id)
     if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
     data = request.get_json(silent=True) or {}
-    target = (data.get("target") or request.form.get("target") or "").strip()
+    raw_target = data.get("target") or data.get("link_or_username") or data.get("peer_id") or request.form.get("target") or ""
+    target = str(raw_target).strip()
     if not target:
         return jsonify({"ok": False, "error": "Provide a public @username or Telegram invite link."}), 400
     try:
         return jsonify(tg_core.join_chat(row, target))
     except Exception as e:
         return jsonify({"ok": False, "error": (str(e) or e.__class__.__name__ or "Telegram request failed")}), 500
+
+
+@app.route("/api/v1/sessions/<int:session_id>/leave", methods=["POST"])
+def api_leave(session_id):
+    u, err = api_user()
+    if err: return err
+    row = api_owned_session(u, session_id)
+    if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
+    data = request.get_json(silent=True) or {}
+    raw_target = data.get("target") or data.get("peer_id") or data.get("username") or ""
+    target = str(raw_target).strip()
+    if not target:
+        return jsonify({"ok": False, "error": "Provide a channel or group to leave."}), 400
+    try:
+        return jsonify(tg_core.leave_chat(row, target))
+    except Exception as e:
+        return jsonify({"ok": False, "error": (str(e) or e.__class__.__name__ or "Telegram request failed")}), 500
+
+
+@app.route("/api/v1/sessions/<int:session_id>/resolve")
+def api_resolve_peer(session_id):
+    u, err = api_user()
+    if err: return err
+    row = api_owned_session(u, session_id)
+    if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
+    q = (request.args.get("q") or request.args.get("username") or request.args.get("peer") or "").strip()
+    if not q:
+        return jsonify({"ok": False, "error": "Provide ?q=<@username or link>."}), 400
+    try:
+        return jsonify({"ok": True, "peer": tg_core.resolve_peer(row, q)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": (str(e) or e.__class__.__name__ or "Could not resolve peer")}), 404
 
 
 @app.route("/api/v1/sessions/<int:session_id>/2fa/change", methods=["POST"])

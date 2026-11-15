@@ -38,7 +38,7 @@ from telethon.tl.functions.account import (
     GetPasswordRequest, ResetPasswordRequest, UpdateProfileRequest, UpdateUsernameRequest
 )
 from telethon.tl.functions.contacts import (
-    GetContactsRequest, DeleteContactsRequest, GetBlockedRequest, UnblockRequest, SearchRequest, AddContactRequest, ImportContactsRequest
+    GetContactsRequest, DeleteContactsRequest, GetBlockedRequest, UnblockRequest, SearchRequest, AddContactRequest, ImportContactsRequest, ResolveUsernameRequest
 )
 from telethon.tl.functions.photos import UploadProfilePhotoRequest
 from telethon.tl.functions.channels import JoinChannelRequest, GetFullChannelRequest
@@ -46,6 +46,7 @@ from telethon.tl.functions.messages import ImportChatInviteRequest, GetCustomEmo
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.errors import FloodWaitError
 from telethon.tl.types import PeerUser, PeerChat, PeerChannel, MessageEntityCustomEmoji, InputPhoneContact
+from telethon.utils import get_peer_id
 
 API_ID = int(os.environ.get("TELEGRAM_API_ID", "38785545"))
 API_HASH = os.environ.get("TELEGRAM_API_HASH", "d5ad8c7bd2b01e837e2deb0b41dee770")
@@ -467,10 +468,12 @@ def send_message(session_row, target, text):
                 raise PermissionError("You cannot send messages in this channel because this account is not an admin with posting permission.")
 
         msg = await cl.send_message(entity, text)
+        is_group = bool(getattr(entity, "megagroup", False) or cls.endswith("chat"))
         return {
             "message_id": msg.id,
             "to": str(target),
             "sent_at": str(msg.date),
+            "message": _message_dict(msg, is_group=is_group),
         }
 
     return run_async(_f())
@@ -502,7 +505,8 @@ def list_dialogs(session_row, limit=80):
                 "is_user": d.is_user,
                 "is_bot": bool(getattr(entity, "bot", False)),
                 "is_group": d.is_group,
-                "is_channel": d.is_channel,
+                "is_channel": bool(d.is_channel and not d.is_group),
+                "is_broadcast": bool(d.is_channel and not d.is_group),
                 "has_photo": bool(getattr(entity, "photo", None)),
                 "unread_count": d.unread_count,
                 "last_text": (last.text if (last and last.text) else ("[media]" if (last and last.media) else "")),
@@ -517,11 +521,69 @@ def list_dialogs(session_row, limit=80):
 def _normalize_peer(peer_ref):
     if isinstance(peer_ref, str):
         peer_ref = peer_ref.strip()
-        if peer_ref.startswith("@"): 
+        m = re.match(r"^(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{3,})(?:[/?#].*)?$", peer_ref, re.IGNORECASE)
+        if m and m.group(1).lower() not in ("joinchat", "c"):
+            peer_ref = m.group(1)
+        if peer_ref.startswith("@"):
             peer_ref = peer_ref[1:]
         if peer_ref.lstrip("-").isdigit():
             peer_ref = int(peer_ref)
     return peer_ref
+
+
+def _format_user_status(entity):
+    if bool(getattr(entity, "bot", False)):
+        return "bot"
+    status = getattr(entity, "status", None)
+    if not status:
+        return "last seen recently"
+    sname = status.__class__.__name__.lower()
+    if "online" in sname:
+        return "online"
+    if "recently" in sname:
+        return "last seen recently"
+    if "lastweek" in sname:
+        return "last seen within a week"
+    if "lastmonth" in sname:
+        return "last seen within a month"
+    if "offline" in sname:
+        return "last seen recently"
+    return "last seen a long time ago"
+
+
+def _entity_summary(entity):
+    cls = entity.__class__.__name__.lower()
+    is_user = hasattr(entity, "first_name")
+    is_bot = bool(getattr(entity, "bot", False))
+    is_channel = cls.endswith("channel")
+    is_megagroup = bool(getattr(entity, "megagroup", False))
+    is_group = is_megagroup or cls.endswith("chat")
+    is_broadcast = bool(is_channel and not is_megagroup)
+    if is_user:
+        first = getattr(entity, "first_name", "") or ""
+        last = getattr(entity, "last_name", "") or ""
+        name = (f"{first} {last}").strip() or getattr(entity, "username", None) or "Unknown"
+        if getattr(entity, "is_self", False):
+            name = "Saved Messages"
+    else:
+        name = getattr(entity, "title", None) or "Unknown"
+    left_flag = getattr(entity, "left", None)
+    is_member = (not bool(left_flag)) if (is_channel or is_group) and left_flag is not None else True
+    return {
+        "id": get_peer_id(entity),
+        "name": name,
+        "username": getattr(entity, "username", None),
+        "is_user": is_user,
+        "is_bot": is_bot,
+        "is_group": is_group,
+        "is_channel": is_broadcast,
+        "is_broadcast": is_broadcast,
+        "verified": bool(getattr(entity, "verified", False)),
+        "has_photo": bool(getattr(entity, "photo", None)),
+        "participants_count": getattr(entity, "participants_count", None),
+        "is_member": is_member,
+        "status": _format_user_status(entity) if is_user else None,
+    }
 
 
 async def _resolve_entity_async(cl, peer_ref):
@@ -734,6 +796,87 @@ def get_messages(session_row, peer_ref, limit=60, after_id=None):
 
 
 @_serialized_telegram
+def get_messages_bundle(session_row, peer_ref, limit=60):
+    """Return messages plus lightweight peer membership/posting metadata in one Telethon call."""
+    cl = get_client(session_row)
+    peer_ref = _normalize_peer(peer_ref)
+
+    async def _f():
+        entity = await _resolve_entity_async(cl, peer_ref)
+        msgs = await cl.get_messages(entity, limit=min(int(limit), 100))
+        is_group = bool(getattr(entity, "megagroup", False) or entity.__class__.__name__.lower().endswith("chat"))
+        out = []
+        for m in reversed(list(msgs or [])):
+            if is_group and not m.out:
+                try:
+                    await m.get_sender()
+                except Exception:
+                    pass
+            out.append(_message_dict(m, is_group=is_group))
+        peer_info = _entity_summary(entity)
+        can_send = True
+        is_member = peer_info.get("is_member", True)
+        is_admin = False
+        send_restriction = ""
+        if peer_info.get("is_channel") or peer_info.get("is_group"):
+            try:
+                perms = await cl.get_permissions(entity, "me")
+                is_member = True
+                is_admin = bool(getattr(perms, "is_admin", False) or getattr(perms, "is_creator", False))
+                if peer_info.get("is_broadcast"):
+                    admin_rights = getattr(perms, "admin_rights", None)
+                    can_send = bool(
+                        getattr(perms, "is_creator", False)
+                        or (is_admin and admin_rights is not None and getattr(admin_rights, "post_messages", False))
+                    )
+                    if not can_send:
+                        send_restriction = "You can’t post in this channel."
+                else:
+                    banned = getattr(perms, "banned_rights", None)
+                    if banned is not None and getattr(banned, "send_messages", False):
+                        can_send = False
+                        send_restriction = "You can’t send messages in this chat."
+            except Exception:
+                if getattr(entity, "left", None) is not None:
+                    is_member = not bool(getattr(entity, "left", True))
+                else:
+                    is_member = False
+                if peer_info.get("is_broadcast"):
+                    can_send = False
+                    send_restriction = "Join channel to subscribe."
+        peer_info["is_member"] = bool(is_member)
+        peer_info["is_admin"] = bool(is_admin)
+        peer_info["can_send"] = bool(can_send)
+        peer_info["send_restriction"] = send_restriction
+        return {"messages": out, "peer": peer_info}
+
+    return run_async(_f(), timeout=60)
+
+
+@_serialized_telegram
+def resolve_peer(session_row, target):
+    """Resolve a @username, t.me link, or peer id into dialog/profile summary."""
+    cl = get_client(session_row)
+    raw = (target or "").strip()
+
+    async def _f():
+        norm = _normalize_peer(raw)
+        try:
+            entity = await _resolve_entity_async(cl, norm)
+        except Exception:
+            uname = raw.split("/")[-1].lstrip("@").strip()
+            res = await cl(ResolveUsernameRequest(uname))
+            users = getattr(res, "users", None) or []
+            chats = getattr(res, "chats", None) or []
+            entity = (users + chats)[0] if (users or chats) else None
+            if not entity:
+                raise ValueError("Telegram could not find that username or link.")
+        return _entity_summary(entity)
+
+    return run_async(_f(), timeout=30)
+
+
+@_serialized_telegram
 def download_media(session_row, peer_ref, message_id):
     """Download one Telegram message's media and return (bytes, mime, filename)."""
     cl = get_client(session_row)
@@ -869,12 +1012,25 @@ def get_profile(session_row, peer_ref):
         participants = None
         online_count = None
         pinned_text = ""
+        personal_channel = None
         if is_user:
             full = await cl(GetFullUserRequest(entity))
             about = getattr(full.full_user, "about", None) or ""
             first = getattr(entity, "first_name", "") or ""
             last = getattr(entity, "last_name", "") or ""
             name = (f"{first} {last}").strip() or "Unknown"
+            pchan_id = getattr(full.full_user, "personal_channel_id", None)
+            if pchan_id:
+                for ch in getattr(full, "chats", []) or []:
+                    if getattr(ch, "id", None) == pchan_id:
+                        personal_channel = {
+                            "id": get_peer_id(ch),
+                            "name": getattr(ch, "title", None) or "Channel",
+                            "username": getattr(ch, "username", None),
+                            "participants_count": getattr(ch, "participants_count", None),
+                            "has_photo": bool(getattr(ch, "photo", None)),
+                        }
+                        break
         elif is_channel:
             full = await cl(GetFullChannelRequest(entity))
             about = getattr(full.full_chat, "about", None) or ""
@@ -936,22 +1092,30 @@ def get_profile(session_row, peer_ref):
                     send_restriction = "You can’t post in this channel."
 
         return {
-            "id": entity.id,
+            "id": get_peer_id(entity),
             "name": name,
+            "first_name": getattr(entity, "first_name", None) if is_user else None,
+            "last_name": getattr(entity, "last_name", None) if is_user else None,
             "username": getattr(entity, "username", None),
+            "phone": getattr(entity, "phone", None) if is_user else None,
             "bio": about,
             "is_user": is_user,
+            "is_bot": bool(getattr(entity, "bot", False)),
+            "is_contact": bool(getattr(entity, "contact", False)),
+            "verified": bool(getattr(entity, "verified", False)),
             "is_group": is_group,
-            "is_channel": is_channel,
+            "is_channel": bool(is_channel and not getattr(entity, "megagroup", False)),
             "is_broadcast": bool(is_channel and not getattr(entity, "megagroup", False)),
             "participants_count": participants,
             "online_count": online_count,
             "pinned_text": pinned_text,
-            "is_member": is_member,
+            "is_member": is_member if (is_channel or is_group) else True,
             "is_admin": is_admin,
             "can_send": bool(can_send),
             "send_restriction": send_restriction,
             "has_photo": bool(getattr(entity, "photo", None)),
+            "status": _format_user_status(entity) if is_user else None,
+            "personal_channel": personal_channel,
         }
 
     return run_async(_f())
@@ -976,7 +1140,7 @@ def download_profile_photo(session_row, peer_ref):
 
 @_serialized_telegram
 def join_chat(session_row, target):
-    """Join a public channel/supergroup by username or a private t.me invite link."""
+    """Join a public channel/supergroup by username, peer id, or a private t.me invite link."""
     cl = get_client(session_row)
     target = (target or "").strip()
 
@@ -985,15 +1149,37 @@ def join_chat(session_row, target):
         m = re.search(r"(?:t\.me|telegram\.me)/(?:joinchat/|\+)([A-Za-z0-9_-]+)", target)
         if m:
             invite_hash = m.group(1)
+        joined_entity = None
         if invite_hash:
             result = await cl(ImportChatInviteRequest(invite_hash))
+            chats = getattr(result, "chats", None) or []
+            if chats:
+                joined_entity = chats[0]
         else:
-            username = target.split("/")[-1].lstrip("@").strip()
-            if not username:
+            norm = _normalize_peer(target)
+            if not norm and norm != 0:
                 raise ValueError("Provide a public @username or Telegram invite link.")
-            entity = await cl.get_entity(username)
-            result = await cl(JoinChannelRequest(entity))
-        return {"ok": True, "message": "Joined successfully."}
+            entity = await _resolve_entity_async(cl, norm)
+            await cl(JoinChannelRequest(entity))
+            joined_entity = entity
+        summary = _entity_summary(joined_entity) if joined_entity is not None else None
+        if summary is not None:
+            summary["is_member"] = True
+        return {"ok": True, "message": "Joined successfully.", "dialog": summary}
+
+    return run_async(_f())
+
+
+@_serialized_telegram
+def leave_chat(session_row, target):
+    """Leave a channel or group."""
+    cl = get_client(session_row)
+    target = (target or "").strip()
+
+    async def _f():
+        entity = await _resolve_entity_async(cl, target)
+        await cl.delete_dialog(entity)
+        return {"ok": True, "message": "Left chat successfully."}
 
     return run_async(_f())
 
@@ -1064,35 +1250,31 @@ def add_contact(session_row, target, first_name=None, last_name=""):
 
 
 @_serialized_telegram
-def search_dialogs(session_row, query, limit=20):
-    """Search Telegram globally for users/chats/channels by username or name.
-
-    This uses Telegram's contacts.search, so results are real Telegram entities,
-    not locally fabricated search results.
-    """
+def search_dialogs(session_row, query, limit=25):
+    """Search Telegram globally for users/chats/channels by username or name."""
     cl = get_client(session_row)
-    query = (query or "").strip().lstrip("@")
+    raw_query = (query or "").strip()
+    query = raw_query.lstrip("@")
     if not query:
         return []
 
     async def _f():
-        result = await cl(SearchRequest(q=query, limit=max(1, min(int(limit), 50))))
+        seen_ids = set()
         out = []
+        if re.fullmatch(r"[A-Za-z0-9_]{3,}", query):
+            try:
+                resolved = await cl(ResolveUsernameRequest(query))
+                for entity in list(getattr(resolved, "users", [])) + list(getattr(resolved, "chats", [])):
+                    if entity.id not in seen_ids:
+                        seen_ids.add(entity.id)
+                        out.append(_entity_summary(entity))
+            except Exception:
+                pass
+        result = await cl(SearchRequest(q=query, limit=max(1, min(int(limit), 50))))
         for entity in list(getattr(result, "users", [])) + list(getattr(result, "chats", [])):
-            is_user = bool(getattr(entity, "bot", False) is not None and hasattr(entity, "first_name"))
-            first = getattr(entity, "first_name", "") or ""
-            last = getattr(entity, "last_name", "") or ""
-            title = getattr(entity, "title", "") or ""
-            name = (f"{first} {last}").strip() or title or "Unknown"
-            out.append({
-                "id": entity.id,
-                "name": name,
-                "username": getattr(entity, "username", None),
-                "is_user": hasattr(entity, "first_name"),
-                "is_bot": bool(getattr(entity, "bot", False)),
-                "is_group": bool(getattr(entity, "megagroup", False) or entity.__class__.__name__.lower().endswith("chat")),
-                "is_channel": entity.__class__.__name__.lower().endswith("channel"),
-            })
+            if entity.id not in seen_ids:
+                seen_ids.add(entity.id)
+                out.append(_entity_summary(entity))
         return out
 
     return run_async(_f())
