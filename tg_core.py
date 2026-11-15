@@ -43,16 +43,32 @@ from telethon.tl.functions.contacts import (
 from telethon.tl.functions.photos import UploadProfilePhotoRequest
 from telethon.tl.functions.channels import JoinChannelRequest, GetFullChannelRequest
 from telethon.tl.functions.messages import (
-    ImportChatInviteRequest, GetCustomEmojiDocumentsRequest, GetFullChatRequest,
-    SendReactionRequest, GetAllStickersRequest, GetStickerSetRequest,
-    GetRecentStickersRequest, ForwardMessagesRequest, PinMessageRequest
+    ImportChatInviteRequest, GetCustomEmojiDocumentsRequest, GetFullChatRequest
 )
+try:
+    from telethon.tl.functions.messages import (
+        SendReactionRequest, GetAllStickersRequest, GetStickerSetRequest,
+        GetRecentStickersRequest
+    )
+except ImportError:
+    SendReactionRequest = None
+    GetAllStickersRequest = None
+    GetStickerSetRequest = None
+    GetRecentStickersRequest = None
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.errors import FloodWaitError
 from telethon.tl.types import (
-    PeerUser, PeerChat, PeerChannel, MessageEntityCustomEmoji, InputPhoneContact,
-    InputDocument, InputStickerSetID, ReactionEmoji, DocumentAttributeSticker
+    PeerUser, PeerChat, PeerChannel, MessageEntityCustomEmoji, InputPhoneContact
 )
+try:
+    from telethon.tl.types import (
+        InputDocument, InputStickerSetID, ReactionEmoji, DocumentAttributeSticker
+    )
+except ImportError:
+    InputDocument = None
+    InputStickerSetID = None
+    ReactionEmoji = None
+    DocumentAttributeSticker = None
 from telethon.utils import get_peer_id
 
 API_ID = int(os.environ.get("TELEGRAM_API_ID", "38785545"))
