@@ -1519,8 +1519,30 @@ def api_update_me_profile(session_id):
     row = api_owned_session(u, session_id)
     if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
     data = request.get_json(silent=True) or {}
+    bio_val = data["bio"] if "bio" in data else (data["about"] if "about" in data else None)
+    uname_val = data["username"] if "username" in data else None
     try:
-        profile = tg_core.update_own_profile(row, data.get("first_name", ""), data.get("last_name", ""), data.get("bio", ""))
+        profile = tg_core.update_own_profile(
+            row,
+            first_name=data.get("first_name"),
+            last_name=data.get("last_name"),
+            bio=bio_val,
+            username=uname_val,
+        )
+        return jsonify({"ok": True, "profile": profile})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/v1/sessions/<int:session_id>/me/username", methods=["POST"])
+def api_update_me_username(session_id):
+    u, err = api_user()
+    if err: return err
+    row = api_owned_session(u, session_id)
+    if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
+    data = request.get_json(silent=True) or {}
+    try:
+        profile = tg_core.update_own_username(row, data.get("username", ""))
         return jsonify({"ok": True, "profile": profile})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400

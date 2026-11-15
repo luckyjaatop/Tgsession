@@ -1306,31 +1306,37 @@ def download_custom_emoji(session_row, document_id):
     return run_async(_f(), timeout=60)
 
 
+async def _fetch_own_profile_async(cl):
+    me = await cl.get_me()
+    if not me:
+        return {"name": "Telegram", "first_name": "", "last_name": "", "username": None, "id": None, "bio": "", "has_photo": False}
+    first = getattr(me, "first_name", "") or ""
+    last = getattr(me, "last_name", "") or ""
+    name = (f"{first} {last}").strip() or getattr(me, "username", None) or "Telegram"
+    bio = None
+    try:
+        full = await cl(GetFullUserRequest(me))
+        bio = getattr(getattr(full, "full_user", None), "about", None)
+    except Exception:
+        pass
+    return {
+        "id": me.id,
+        "name": name,
+        "first_name": first,
+        "last_name": last,
+        "username": getattr(me, "username", None),
+        "phone": getattr(me, "phone", None),
+        "bio": bio or "",
+        "has_photo": bool(getattr(me, "photo", None)),
+    }
+
+
 @_serialized_telegram
 def get_own_profile(session_row):
     """Return the currently authorized Telegram account profile."""
     cl = get_client(session_row)
     async def _f():
-        me = await cl.get_me()
-        if not me:
-            return {"name": "Telegram", "username": None, "id": None, "has_photo": False}
-        first = getattr(me, "first_name", "") or ""
-        last = getattr(me, "last_name", "") or ""
-        name = (f"{first} {last}").strip() or getattr(me, "username", None) or "Telegram"
-        bio = None
-        try:
-            full = await cl(GetFullUserRequest(me))
-            bio = getattr(getattr(full, "full_user", None), "about", None)
-        except Exception:
-            pass
-        return {
-            "id": me.id,
-            "name": name,
-            "username": getattr(me, "username", None),
-            "phone": getattr(me, "phone", None),
-            "bio": bio or "",
-            "has_photo": bool(getattr(me, "photo", None)),
-        }
+        return await _fetch_own_profile_async(cl)
     return run_async(_f())
 
 
@@ -1349,12 +1355,49 @@ def download_own_profile_photo(session_row):
     return run_async(_f(), timeout=60)
 
 
+async def _apply_username_async(cl, raw_username):
+    clean = (raw_username or "").strip().lstrip("@")
+    try:
+        await cl(UpdateUsernameRequest(username=clean))
+    except Exception as e:
+        msg = str(e)
+        cls = e.__class__.__name__.lower()
+        if "notmodified" in cls or "not modified" in msg.lower():
+            return
+        if "occupied" in cls or "occupied" in msg.lower():
+            raise ValueError("This username is already taken.")
+        if "invalid" in cls or "invalid" in msg.lower():
+            raise ValueError("Username must be 5–32 chars (a-z, 0-9, _).")
+        if "purchase" in cls or "purchase" in msg.lower():
+            raise ValueError("This collectible username cannot be assigned here.")
+        raise ValueError(msg or "Could not update username.")
+
+
 @_serialized_telegram
-def update_own_profile(session_row, first_name, last_name="", bio=""):
+def update_own_profile(session_row, first_name=None, last_name=None, bio=None, username=None):
     cl = get_client(session_row)
     async def _f():
-        await cl(UpdateProfileRequest(first_name=(first_name or "").strip(), last_name=(last_name or "").strip(), about=(bio or "").strip()))
-        return get_own_profile(session_row)
+        kwargs = {}
+        if first_name is not None:
+            kwargs["first_name"] = str(first_name).strip()
+        if last_name is not None:
+            kwargs["last_name"] = str(last_name).strip()
+        if bio is not None:
+            kwargs["about"] = str(bio).strip()[:70]
+        if kwargs:
+            await cl(UpdateProfileRequest(**kwargs))
+        if username is not None:
+            await _apply_username_async(cl, username)
+        return await _fetch_own_profile_async(cl)
+    return run_async(_f())
+
+
+@_serialized_telegram
+def update_own_username(session_row, username=""):
+    cl = get_client(session_row)
+    async def _f():
+        await _apply_username_async(cl, username)
+        return await _fetch_own_profile_async(cl)
     return run_async(_f())
 
 
@@ -1376,6 +1419,7 @@ def get_profile(session_row, peer_ref, fallback_username=None):
         online_count = None
         pinned_text = ""
         personal_channel = None
+        linked_chat = None
         if is_user:
             full = await cl(GetFullUserRequest(entity))
             about = getattr(full.full_user, "about", None) or ""
@@ -1406,6 +1450,18 @@ def get_profile(session_row, peer_ref, fallback_username=None):
                     pinned_text = (pm.text or "") if pm else ""
                 except Exception:
                     pass
+            linked_id = getattr(full.full_chat, "linked_chat_id", None)
+            if linked_id:
+                for ch in getattr(full, "chats", []) or []:
+                    if getattr(ch, "id", None) == linked_id:
+                        linked_chat = {
+                            "id": get_peer_id(ch),
+                            "name": getattr(ch, "title", None) or "Discussion",
+                            "username": getattr(ch, "username", None),
+                            "participants_count": getattr(ch, "participants_count", None),
+                            "has_photo": bool(getattr(ch, "photo", None)),
+                        }
+                        break
             name = getattr(entity, "title", None) or "Channel"
         else:
             name = getattr(entity, "title", None) or "Group"
@@ -1479,6 +1535,7 @@ def get_profile(session_row, peer_ref, fallback_username=None):
             "has_photo": bool(getattr(entity, "photo", None)),
             "status": _format_user_status(entity) if is_user else None,
             "personal_channel": personal_channel,
+            "linked_chat": linked_chat,
         }
 
     return run_async(_f())
