@@ -17,6 +17,9 @@ import re
 import tempfile
 import os
 import time
+import base64
+import json
+import struct
 import uuid
 import contextvars
 from functools import wraps
@@ -24,7 +27,12 @@ from functools import wraps
 import db
 
 from telethon import TelegramClient, events
+from telethon.crypto import AuthKey
 from telethon.sessions import StringSession
+from telethon.errors import (
+    SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError,
+    PasswordHashInvalidError, PhoneNumberInvalidError, PhoneNumberBannedError
+)
 from telethon.tl.functions.account import (
     GetAuthorizationsRequest, ResetAuthorizationRequest,
     GetPasswordRequest, ResetPasswordRequest, UpdateProfileRequest, UpdateUsernameRequest
@@ -88,22 +96,114 @@ async def _connect_string(ss_str, aid, ahash):
     return None
 
 
-async def _load_from_raw(raw: bytes):
-    """Try to build a connected, authorized client from raw bytes (either a
-    StringSession's text, or a raw SQLite .session file). Returns
-    (client, session_string) or (None, None)."""
-    is_sqlite = raw[:16] == b"SQLite format 3\x00"
+DC_IPS = {
+    1: "149.154.175.53",
+    2: "149.154.167.51",
+    3: "149.154.175.100",
+    4: "149.154.167.91",
+    5: "91.108.56.130",
+}
 
+
+def _build_telethon_string(dc_id: int, key_bytes: bytes) -> str:
+    if dc_id not in DC_IPS or len(key_bytes) != 256:
+        raise ValueError("Invalid DC ID or auth key length.")
+    ss = StringSession()
+    ss.set_dc(int(dc_id), DC_IPS[int(dc_id)], 443)
+    ss.auth_key = AuthKey(data=key_bytes)
+    return ss.save()
+
+
+def _safe_b64_decode(val: str) -> bytes:
+    cleaned = re.sub(r"\s+", "", val)
+    cleaned = cleaned.replace("-", "+").replace("_", "/")
+    pad = (-len(cleaned)) % 4
+    if pad:
+        cleaned += "=" * pad
+    return base64.b64decode(cleaned)
+
+
+def _parse_text_candidates(raw_text: str, dc_id_hint: int | None = None):
+    """Parse Telethon, Pyrogram v1/v2, JSON, or 512-char Hex Auth Key strings.
+    Returns list of (telethon_string, detected_type, dc_id)."""
+    s = raw_text.strip()
+    if not s:
+        return []
+
+    if s.startswith("{") and s.endswith("}"):
+        try:
+            obj = json.loads(s)
+            nested = (
+                obj.get("session_string")
+                or obj.get("sessionString")
+                or obj.get("session")
+                or obj.get("string")
+                or obj.get("telethon")
+                or obj.get("pyrogram")
+            )
+            if isinstance(nested, str) and nested.strip():
+                return _parse_text_candidates(nested, dc_id_hint=dc_id_hint)
+            key = obj.get("auth_key") or obj.get("authKey") or obj.get("key") or obj.get("hex")
+            dc = obj.get("dc_id") or obj.get("dcId") or obj.get("dc") or dc_id_hint
+            if isinstance(key, str) and dc is not None:
+                dc_int = int(dc)
+                kclean = re.sub(r"\s+", "", key)
+                key_bytes = bytes.fromhex(kclean) if re.fullmatch(r"[0-9a-fA-F]{512}", kclean) else _safe_b64_decode(kclean)
+                return [(_build_telethon_string(dc_int, key_bytes), "JSON Session Data", dc_int)]
+        except Exception:
+            pass
+
+    clean = re.sub(r"\s+", "", s)
+    if re.fullmatch(r"[0-9a-fA-F]{512}", clean):
+        key_bytes = bytes.fromhex(clean)
+        dcs = [int(dc_id_hint)] if dc_id_hint in DC_IPS else [2, 4, 1, 5, 3]
+        return [(_build_telethon_string(dc, key_bytes), "Hex Auth Key", dc) for dc in dcs]
+
+    if clean.startswith("1"):
+        try:
+            parsed = StringSession(clean)
+            if parsed.auth_key and len(parsed.auth_key.key) == 256:
+                return [(clean, "Telethon String Session", int(parsed.dc_id or 2))]
+        except Exception:
+            pass
+
+    try:
+        decoded = _safe_b64_decode(clean)
+        ln = len(decoded)
+        if ln == 271 and decoded[0] in DC_IPS:
+            dc = int(decoded[0])
+            return [(_build_telethon_string(dc, decoded[6:262]), "Pyrogram v2 Session", dc)]
+        if ln in (267, 263) and decoded[0] in DC_IPS:
+            dc = int(decoded[0])
+            return [(_build_telethon_string(dc, decoded[2:258]), "Pyrogram v1 Session", dc)]
+        if ln == 260 and decoded[0] in DC_IPS:
+            dc = int(decoded[0])
+            return [(_build_telethon_string(dc, decoded[4:260]), "Pyrogram Session", dc)]
+        if ln >= 261 and decoded[0] in DC_IPS:
+            dc = int(decoded[0])
+            return [(_build_telethon_string(dc, decoded[-256:]), "Telethon String Session", dc)]
+    except Exception:
+        pass
+
+    return [(s, "Telethon String Session", int(dc_id_hint or 2))]
+
+
+async def _load_from_raw(raw: bytes, dc_id_hint: int | None = None):
+    """Try to build a connected, authorized client from raw bytes (Telethon,
+    Pyrogram, JSON, Hex Auth Key, or SQLite .session file).
+    Returns (client, session_string, detected_type, dc_id) or (None, None, None, None)."""
+    is_sqlite = raw[:16] == b"SQLite format 3\x00"
     if not is_sqlite:
         try:
-            ss_str = raw.decode("utf-8").strip()
-            for aid, ahash in API_PAIRS:
-                try:
-                    cl = await _connect_string(ss_str, aid, ahash)
-                    if cl:
-                        return cl, ss_str
-                except Exception:
-                    pass
+            ss_text = raw.decode("utf-8").strip()
+            for candidate_ss, dtype, dc_id in _parse_text_candidates(ss_text, dc_id_hint=dc_id_hint):
+                for aid, ahash in API_PAIRS:
+                    try:
+                        cl = await _connect_string(candidate_ss, aid, ahash)
+                        if cl:
+                            return cl, candidate_ss, dtype, dc_id
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -118,10 +218,11 @@ async def _load_from_raw(raw: bytes):
                 await cl.connect()
                 if await cl.is_user_authorized():
                     ss_str = StringSession.save(cl.session)
+                    dc_id = int(getattr(cl.session, "dc_id", 2) or 2)
                     await cl.disconnect()
                     cl2 = await _connect_string(ss_str, aid, ahash)
                     if cl2:
-                        return cl2, ss_str
+                        return cl2, ss_str, "SQLite .session File", dc_id
                 else:
                     await cl.disconnect()
             except Exception:
@@ -135,24 +236,48 @@ async def _load_from_raw(raw: bytes):
             os.remove(tmp)
         except Exception:
             pass
+    return None, None, None, None
 
-    return None, None
 
+def inspect_session_bytes(raw: bytes, dc_id_hint: int | None = None):
+    """Validate and inspect session bytes without saving to DB."""
+    async def _inspect():
+        cl, ss, dtype, dc_id = await _load_from_raw(raw, dc_id_hint=dc_id_hint)
+        if not cl:
+            return None
+        try:
+            me = await cl.get_me()
+            if not me:
+                return None
+            name = f"{me.first_name or ''} {me.last_name or ''}".strip() or "Telegram User"
+            phone = me.phone or ""
+            username = getattr(me, "username", None) or ""
+            return {
+                "valid": True,
+                "type": dtype or "Telethon String Session",
+                "dc_id": int(dc_id or 2),
+                "user_id": int(me.id),
+                "name": name,
+                "phone": phone,
+                "username": username,
+                "session_string": ss,
+            }
+        finally:
+            try:
+                await cl.disconnect()
+            except Exception:
+                pass
 
-def login_from_bytes(raw: bytes):
-    """Sync wrapper: returns (session_string, name, phone) or raises ValueError."""
-    cl, ss = run_async(_load_from_raw(raw))
-    if not cl:
+    info = run_async(_inspect())
+    if not info:
         raise ValueError("Could not authorize this session (invalid, expired, or revoked).")
-    me = run_async(cl.get_me())
-    name = f"{me.first_name or ''} {me.last_name or ''}".strip() or "Unknown"
-    phone = me.phone or "unknown"
+    return info
 
-    async def _disc():
-        await cl.disconnect()
 
-    run_async(_disc())
-    return ss, name, phone
+def login_from_bytes(raw: bytes, dc_id_hint: int | None = None):
+    """Sync wrapper: returns (session_string, name, phone) or raises ValueError."""
+    info = inspect_session_bytes(raw, dc_id_hint=dc_id_hint)
+    return info["session_string"], info["name"], info["phone"] or "unknown"
 
 
 def validate_session(session_row):
@@ -1286,3 +1411,158 @@ def pop_give_messages(session_id, block_timeout=15):
         return q.get(timeout=block_timeout)
     except queue.Empty:
         return None
+
+# ─────────────────────── phone OTP + 2FA login & export ───────────────────────
+
+def _normalize_phone(phone: str) -> str:
+    cleaned = re.sub(r"[^\d+]", "", (phone or "").strip())
+    if cleaned and not cleaned.startswith("+"):
+        cleaned = "+" + cleaned
+    if not re.fullmatch(r"\+\d{7,15}", cleaned):
+        raise ValueError("Enter a valid phone number with country code (e.g. +15551234567).")
+    return cleaned
+
+
+def _delivery_label(sent) -> str:
+    t = str(getattr(getattr(sent, "type", None), "__class__", "") or getattr(sent, "type", "")).lower()
+    if "app" in t:
+        return "Telegram app"
+    if "sms" in t:
+        return "SMS"
+    if "call" in t:
+        return "Phone call"
+    if "email" in t:
+        return "Email"
+    return "Telegram"
+
+
+def start_phone_login(phone: str):
+    clean_phone = _normalize_phone(phone)
+    aid, ahash = API_PAIRS[0]
+
+    async def _start():
+        cl = TelegramClient(StringSession(), aid, ahash)
+        await cl.connect()
+        try:
+            sent = await cl.send_code_request(clean_phone)
+            temp_ss = StringSession.save(cl.session)
+            return {
+                "phone": clean_phone,
+                "phone_code_hash": sent.phone_code_hash,
+                "temp_session": temp_ss,
+                "delivery": _delivery_label(sent),
+                "api_id": aid,
+                "api_hash": ahash,
+            }
+        except PhoneNumberInvalidError:
+            raise ValueError("Invalid phone number format.")
+        except PhoneNumberBannedError:
+            raise ValueError("This phone number is banned on Telegram.")
+        except FloodWaitError as fw:
+            raise ValueError(f"Too many attempts. Please wait {fw.seconds} seconds.")
+        finally:
+            try:
+                await cl.disconnect()
+            except Exception:
+                pass
+
+    return run_async(_start())
+
+
+def verify_phone_code(temp_session: str, api_id: int, api_hash: str, phone: str, phone_code_hash: str, code: str):
+    clean_code = re.sub(r"\s+", "", (code or "").strip())
+    if not clean_code:
+        raise ValueError("Verification code cannot be empty.")
+
+    async def _verify():
+        cl = TelegramClient(StringSession(temp_session), int(api_id), api_hash)
+        await cl.connect()
+        try:
+            try:
+                await cl.sign_in(phone=phone, code=clean_code, phone_code_hash=phone_code_hash)
+            except SessionPasswordNeededError:
+                hint = ""
+                try:
+                    pwd = await cl(GetPasswordRequest())
+                    hint = getattr(pwd, "hint", "") or ""
+                except Exception:
+                    pass
+                new_temp = StringSession.save(cl.session)
+                return {
+                    "password_required": True,
+                    "temp_session": new_temp,
+                    "hint": hint,
+                }
+            except PhoneCodeInvalidError:
+                raise ValueError("Invalid verification code. Please check and try again.")
+            except PhoneCodeExpiredError:
+                raise ValueError("This verification code expired. Please request a new code.")
+            except FloodWaitError as fw:
+                raise ValueError(f"Too many attempts. Please wait {fw.seconds} seconds.")
+
+            ss = StringSession.save(cl.session)
+            me = await cl.get_me()
+            name = f"{getattr(me, 'first_name', '') or ''} {getattr(me, 'last_name', '') or ''}".strip() or "Telegram User"
+            resolved_phone = getattr(me, "phone", None) or phone
+            return {
+                "password_required": False,
+                "session_string": ss,
+                "name": name,
+                "phone": resolved_phone,
+                "user_id": int(me.id),
+            }
+        finally:
+            try:
+                await cl.disconnect()
+            except Exception:
+                pass
+
+    return run_async(_verify())
+
+
+def verify_phone_password(temp_session: str, api_id: int, api_hash: str, phone: str, password: str):
+    if not password:
+        raise ValueError("Two-Step Verification password cannot be empty.")
+
+    async def _verify_pw():
+        cl = TelegramClient(StringSession(temp_session), int(api_id), api_hash)
+        await cl.connect()
+        try:
+            try:
+                await cl.sign_in(password=password)
+            except PasswordHashInvalidError:
+                raise ValueError("Incorrect Two-Step Verification password.")
+            except FloodWaitError as fw:
+                raise ValueError(f"Too many attempts. Please wait {fw.seconds} seconds.")
+
+            ss = StringSession.save(cl.session)
+            me = await cl.get_me()
+            name = f"{getattr(me, 'first_name', '') or ''} {getattr(me, 'last_name', '') or ''}".strip() or "Telegram User"
+            resolved_phone = getattr(me, "phone", None) or phone
+            return {
+                "session_string": ss,
+                "name": name,
+                "phone": resolved_phone,
+                "user_id": int(me.id),
+            }
+        finally:
+            try:
+                await cl.disconnect()
+            except Exception:
+                pass
+
+    return run_async(_verify_pw())
+
+
+def export_session_formats(session_row):
+    ss = (session_row.get("session_string") or "").strip()
+    if not ss:
+        raise ValueError("Session string is empty.")
+    parsed = StringSession(ss)
+    dc_id = int(parsed.dc_id or 2)
+    hex_key = parsed.auth_key.key.hex() if parsed.auth_key else ""
+    return {
+        "dc_id": dc_id,
+        "telethon": ss,
+        "hex": hex_key,
+    }

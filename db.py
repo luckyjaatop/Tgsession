@@ -113,6 +113,8 @@ def init_db():
     database.registrations.create_index([("ip", ASCENDING), ("created_at", ASCENDING)])
     database.orders.create_index([("order_id", ASCENDING)], unique=True)
     database.orders.create_index([("user_id", ASCENDING)])
+    database.pending_logins.create_index([("token", ASCENDING)], unique=True)
+    database.pending_logins.create_index([("expires_at", ASCENDING)], expireAfterSeconds=0)
 
     # Seed a default admin account on first run
     if database.users.count_documents({"is_admin": 1}) == 0:
@@ -511,3 +513,47 @@ def revoke_api_key(key_id, user_id):
 
 def touch_api_key(key_id):
     _get_db().api_keys.update_one({"id": int(key_id)}, {"$set": {"last_used_at": now()}})
+
+# ───────────────────────── pending OTP logins ─────────────────────────
+
+def create_pending_login(user_id, phone, phone_code_hash, temp_session, api_id, api_hash, ttl_seconds=600):
+    import secrets
+    token = secrets.token_urlsafe(24)
+    expires = datetime.now(timezone.utc) + timedelta(seconds=int(ttl_seconds))
+    _get_db().pending_logins.insert_one({
+        "token": token,
+        "user_id": int(user_id),
+        "phone": phone,
+        "phone_code_hash": phone_code_hash,
+        "temp_session": temp_session,
+        "api_id": int(api_id),
+        "api_hash": api_hash,
+        "needs_password": False,
+        "hint": "",
+        "expires_at": expires,
+        "created_at": now(),
+    })
+    return token
+
+
+def get_pending_login(token, user_id):
+    doc = _get_db().pending_logins.find_one({"token": token, "user_id": int(user_id)})
+    if not doc:
+        return None
+    exp = doc.get("expires_at")
+    if exp is not None:
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        if exp <= datetime.now(timezone.utc):
+            delete_pending_login(token)
+            return None
+    return _strip(doc)
+
+
+def update_pending_login(token, **fields):
+    if fields:
+        _get_db().pending_logins.update_one({"token": token}, {"$set": fields})
+
+
+def delete_pending_login(token):
+    _get_db().pending_logins.delete_one({"token": token})

@@ -727,6 +727,48 @@ def api_sessions():
     response.headers["Pragma"] = "no-cache"
     return response
 
+def _extract_session_raw_and_dc():
+    f = request.files.get("session_file")
+    dc_val = request.form.get("dc_id")
+    if f and f.filename:
+        raw = f.read()
+    else:
+        data = request.get_json(silent=True) or {}
+        ss = data.get("session_string") or data.get("session") or request.form.get("session_string") or request.form.get("session")
+        raw = ss.strip().encode("utf-8") if ss else None
+        if dc_val is None:
+            dc_val = data.get("dc_id")
+    try:
+        dc_hint = int(dc_val) if dc_val is not None and str(dc_val).strip() else None
+    except Exception:
+        dc_hint = None
+    return raw, dc_hint
+
+
+@app.route("/api/v1/sessions/resolve", methods=["POST"])
+def api_sessions_resolve():
+    """Validate and inspect a session string/file without saving it to the database."""
+    u, err = api_user()
+    if err: return err
+    raw, dc_hint = _extract_session_raw_and_dc()
+    if not raw:
+        return jsonify({"ok": False, "error": "Provide a session_file upload or a session_string field."}), 400
+    try:
+        info = tg_core.inspect_session_bytes(raw, dc_id_hint=dc_hint)
+        return jsonify({
+            "ok": True,
+            "valid": True,
+            "type": info["type"],
+            "dc_id": info["dc_id"],
+            "user_id": info["user_id"],
+            "name": info["name"],
+            "phone": info["phone"],
+            "username": info["username"],
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
 @app.route("/api/v1/sessions/add", methods=["POST"])
 def api_sessions_add():
     """Add one session. Accepts either a multipart file upload
@@ -736,21 +778,12 @@ def api_sessions_add():
     if not u["is_admin"] and db.count_sessions(u["user_id"]) >= u["max_sessions"]:
         return jsonify({"ok": False, "error": f"Session limit reached ({u['max_sessions']})."}), 403
 
-    raw = None
-    f = request.files.get("session_file")
-    if f and f.filename:
-        raw = f.read()
-    else:
-        data = request.get_json(silent=True) or {}
-        ss = data.get("session_string") or request.form.get("session_string")
-        if ss:
-            raw = ss.strip().encode("utf-8")
-
+    raw, dc_hint = _extract_session_raw_and_dc()
     if not raw:
         return jsonify({"ok": False, "error": "Provide a session_file upload or a session_string field."}), 400
 
     try:
-        ss, name, phone = tg_core.login_from_bytes(raw)
+        ss, name, phone = tg_core.login_from_bytes(raw, dc_id_hint=dc_hint)
         sid = db.add_session(u["user_id"], phone, name, ss)
 
         # Verify the newly inserted row is immediately visible to the same
@@ -810,6 +843,161 @@ def api_sessions_add_zip():
         time.sleep(1.2)  # pace logins to avoid Telegram flood-limits
 
     return jsonify({"ok": True, "added": success, "failed": fail, "results": results})
+
+
+@app.route("/api/v1/sessions/login/start", methods=["POST"])
+def api_sessions_login_start():
+    """Start phone + OTP login and store the pending Telethon pre-auth session in MongoDB."""
+    u, err = api_user()
+    if err: return err
+    if not u["is_admin"] and db.count_sessions(u["user_id"]) >= u["max_sessions"]:
+        return jsonify({"ok": False, "error": f"Session limit reached ({u['max_sessions']})."}), 403
+    data = request.get_json(silent=True) or {}
+    phone = (data.get("phone") or request.form.get("phone") or "").strip()
+    if not phone:
+        return jsonify({"ok": False, "error": "Provide a phone number with country code."}), 400
+    try:
+        started = tg_core.start_phone_login(phone)
+        token = db.create_pending_login(
+            user_id=u["user_id"],
+            phone=started["phone"],
+            phone_code_hash=started["phone_code_hash"],
+            temp_session=started["temp_session"],
+            api_id=started["api_id"],
+            api_hash=started["api_hash"],
+        )
+        return jsonify({
+            "ok": True,
+            "login_token": token,
+            "phone": started["phone"],
+            "delivery": started["delivery"],
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/v1/sessions/login/code", methods=["POST"])
+def api_sessions_login_code():
+    """Verify the Telegram OTP code for a pending login."""
+    u, err = api_user()
+    if err: return err
+    data = request.get_json(silent=True) or {}
+    token = (data.get("login_token") or request.form.get("login_token") or "").strip()
+    code = (data.get("code") or request.form.get("code") or "").strip()
+    if not token or not code:
+        return jsonify({"ok": False, "error": "Provide login_token and code."}), 400
+    pending = db.get_pending_login(token, u["user_id"])
+    if not pending:
+        return jsonify({"ok": False, "error": "Login attempt expired or not found. Please request a new code."}), 404
+    try:
+        res = tg_core.verify_phone_code(
+            temp_session=pending["temp_session"],
+            api_id=pending["api_id"],
+            api_hash=pending["api_hash"],
+            phone=pending["phone"],
+            phone_code_hash=pending["phone_code_hash"],
+            code=code,
+        )
+        if res.get("password_required"):
+            db.update_pending_login(
+                token,
+                temp_session=res["temp_session"],
+                needs_password=True,
+                hint=res.get("hint") or "",
+            )
+            return jsonify({
+                "ok": True,
+                "password_required": True,
+                "hint": res.get("hint") or "",
+            })
+
+        if not u["is_admin"] and db.count_sessions(u["user_id"]) >= u["max_sessions"]:
+            db.delete_pending_login(token)
+            return jsonify({"ok": False, "error": f"Session limit reached ({u['max_sessions']})."}), 403
+
+        sid = db.add_session(u["user_id"], res["phone"], res["name"], res["session_string"])
+        db.delete_pending_login(token)
+        saved = db.get_session(sid) if sid is not None else None
+        if not saved:
+            return jsonify({"ok": False, "error": "Logged in, but failed to save session. Please try again."}), 500
+        return jsonify({
+            "ok": True,
+            "password_required": False,
+            "session": {
+                "id": saved["id"],
+                "name": saved["name"],
+                "phone": saved["phone"],
+                "created_at": saved["created_at"],
+            },
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/v1/sessions/login/password", methods=["POST"])
+def api_sessions_login_password():
+    """Complete a pending phone login that requires a 2FA password."""
+    u, err = api_user()
+    if err: return err
+    data = request.get_json(silent=True) or {}
+    token = (data.get("login_token") or request.form.get("login_token") or "").strip()
+    password = data.get("password") if "password" in data else request.form.get("password")
+    if not token or not password:
+        return jsonify({"ok": False, "error": "Provide login_token and password."}), 400
+    pending = db.get_pending_login(token, u["user_id"])
+    if not pending:
+        return jsonify({"ok": False, "error": "Login attempt expired or not found. Please start again."}), 404
+    try:
+        res = tg_core.verify_phone_password(
+            temp_session=pending["temp_session"],
+            api_id=pending["api_id"],
+            api_hash=pending["api_hash"],
+            phone=pending["phone"],
+            password=password,
+        )
+        if not u["is_admin"] and db.count_sessions(u["user_id"]) >= u["max_sessions"]:
+            db.delete_pending_login(token)
+            return jsonify({"ok": False, "error": f"Session limit reached ({u['max_sessions']})."}), 403
+
+        sid = db.add_session(u["user_id"], res["phone"], res["name"], res["session_string"])
+        db.delete_pending_login(token)
+        saved = db.get_session(sid) if sid is not None else None
+        if not saved:
+            return jsonify({"ok": False, "error": "Logged in, but failed to save session. Please try again."}), 500
+        return jsonify({
+            "ok": True,
+            "session": {
+                "id": saved["id"],
+                "name": saved["name"],
+                "phone": saved["phone"],
+                "created_at": saved["created_at"],
+            },
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/v1/sessions/login/cancel", methods=["POST"])
+def api_sessions_login_cancel():
+    u, err = api_user()
+    if err: return err
+    data = request.get_json(silent=True) or {}
+    token = (data.get("login_token") or "").strip()
+    if token and db.get_pending_login(token, u["user_id"]):
+        db.delete_pending_login(token)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/v1/sessions/<int:session_id>/export")
+def api_session_export(session_id):
+    u, err = api_user()
+    if err: return err
+    row = api_owned_session(u, session_id)
+    if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
+    try:
+        return jsonify({"ok": True, **tg_core.export_session_formats(row)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
 
 
 @app.route("/api/v1/sessions/<int:session_id>/otp")
