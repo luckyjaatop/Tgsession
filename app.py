@@ -1026,12 +1026,13 @@ def api_send_message(session_id):
     peer_id = data.get("peer_id")
     username = (data.get("username") or request.form.get("username") or "").strip().lstrip("@")
     text = data.get("message") or request.form.get("message") or ""
+    reply_to = data.get("reply_to_msg_id")
     if not text or (not username and not peer_id):
         return jsonify({"ok": False, "error": "Provide 'message' plus either 'username' or 'peer_id'."}), 400
 
     target = int(peer_id) if peer_id else username
     try:
-        result = tg_core.send_message(row, target, text)
+        result = tg_core.send_message(row, target, text, reply_to=reply_to, fallback_username=username)
         return jsonify({
             "ok": True,
             "result": result,
@@ -1121,6 +1122,7 @@ def api_messages(session_id):
     row = api_owned_session(u, session_id)
     if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
     peer = request.args.get("peer") or request.args.get("username")
+    fallback_username = request.args.get("username")
     if not peer:
         return jsonify({"ok": False, "error": "Provide ?peer=<dialog id> or ?username=<username>."}), 400
     last_error = None
@@ -1129,7 +1131,7 @@ def api_messages(session_id):
     # transient CancelledError to the UI.
     for attempt in range(3):
         try:
-            bundle = tg_core.get_messages_bundle(row, peer, limit=50)
+            bundle = tg_core.get_messages_bundle(row, peer, limit=50, fallback_username=fallback_username)
             return jsonify({"ok": True, "messages": bundle["messages"], "peer": bundle["peer"]})
         except Exception as e:
             last_error = e
@@ -1147,13 +1149,14 @@ def api_message_updates(session_id):
     row = api_owned_session(u, session_id)
     if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
     peer = request.args.get("peer") or request.args.get("username")
+    fallback_username = request.args.get("username")
     if not peer:
         return jsonify({"ok": False, "error": "Provide ?peer=<dialog id> or ?username=<username>."}), 400
     last_error = None
     for attempt in range(2):
         try:
             after_id = int(request.args.get("after_id") or 0)
-            messages = tg_core.get_messages(row, peer, limit=50, after_id=after_id)
+            messages = tg_core.get_messages(row, peer, limit=50, after_id=after_id, fallback_username=fallback_username)
             return jsonify({"ok": True, "messages": messages})
         except Exception as e:
             last_error = e
@@ -1261,13 +1264,209 @@ def api_media(session_id, message_id):
     row = api_owned_session(u, session_id)
     if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
     peer = request.args.get("peer") or request.args.get("username")
+    fallback_username = request.args.get("username")
+    thumb = request.args.get("thumb") == "1"
     if not peer:
         return jsonify({"ok": False, "error": "Provide ?peer=<id> or ?username=<username>."}), 400
     try:
-        data, mime, name = tg_core.download_media(row, peer, message_id)
+        data, mime, name = tg_core.download_media(row, peer, message_id, thumb=thumb, fallback_username=fallback_username)
         return send_file(io.BytesIO(data), mimetype=mime, as_attachment=False, download_name=name)
     except Exception as e:
         return jsonify({"ok": False, "error": (str(e) or e.__class__.__name__ or "Telegram request failed")}), 500
+
+
+@app.route("/api/v1/sessions/<int:session_id>/send_media", methods=["POST"])
+def api_send_media(session_id):
+    u, err = api_user()
+    if err: return err
+    row = api_owned_session(u, session_id)
+    if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"ok": False, "error": "Provide multipart 'file'."}), 400
+    peer_id = request.form.get("peer_id")
+    username = (request.form.get("username") or "").strip().lstrip("@")
+    if not peer_id and not username:
+        return jsonify({"ok": False, "error": "Provide 'peer_id' or 'username'."}), 400
+    target = int(peer_id) if peer_id and peer_id != "0" else username
+    caption = request.form.get("caption") or ""
+    force_document = request.form.get("force_document") in ("1", "true", "True")
+    reply_to = request.form.get("reply_to_msg_id")
+    try:
+        res = tg_core.send_media(
+            row, target, f.read(), f.filename or "upload.bin",
+            caption=caption, force_document=force_document,
+            reply_to=reply_to, fallback_username=username,
+        )
+        return jsonify({"ok": True, **res})
+    except PermissionError as e:
+        return jsonify({"ok": False, "error": str(e)}), 403
+    except Exception as e:
+        return jsonify({"ok": False, "error": (str(e) or e.__class__.__name__ or "Upload failed")}), 500
+
+
+@app.route("/api/v1/sessions/<int:session_id>/stickers")
+def api_stickers(session_id):
+    u, err = api_user()
+    if err: return err
+    row = api_owned_session(u, session_id)
+    if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
+    try:
+        return jsonify({"ok": True, **tg_core.get_stickers(row)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": (str(e) or e.__class__.__name__ or "Failed to load stickers")}), 500
+
+
+@app.route("/api/v1/sessions/<int:session_id>/sticker/<int:document_id>")
+def api_sticker_image(session_id, document_id):
+    u, err = api_user()
+    if err: return err
+    row = api_owned_session(u, session_id)
+    if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
+    access_hash = request.args.get("access_hash")
+    ref = request.args.get("ref") or ""
+    if not access_hash:
+        return jsonify({"ok": False, "error": "Missing access_hash"}), 400
+    try:
+        data, mime = tg_core.download_sticker_image(row, document_id, access_hash, ref)
+        if not data:
+            return jsonify({"ok": False, "error": "Sticker not found"}), 404
+        return send_file(io.BytesIO(data), mimetype=mime, as_attachment=False)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+
+
+@app.route("/api/v1/sessions/<int:session_id>/send_sticker", methods=["POST"])
+def api_send_sticker(session_id):
+    u, err = api_user()
+    if err: return err
+    row = api_owned_session(u, session_id)
+    if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
+    data = request.get_json(silent=True) or {}
+    peer_id = data.get("peer_id")
+    username = (data.get("username") or "").strip().lstrip("@")
+    doc_id = data.get("document_id")
+    access_hash = data.get("access_hash")
+    ref = data.get("file_reference") or ""
+    reply_to = data.get("reply_to_msg_id")
+    if not doc_id or access_hash is None or (not peer_id and not username):
+        return jsonify({"ok": False, "error": "Missing peer or sticker parameters."}), 400
+    target = int(peer_id) if peer_id else username
+    try:
+        res = tg_core.send_sticker(row, target, doc_id, access_hash, ref, reply_to=reply_to, fallback_username=username)
+        return jsonify({"ok": True, **res})
+    except Exception as e:
+        return jsonify({"ok": False, "error": (str(e) or e.__class__.__name__ or "Failed to send sticker")}), 500
+
+
+@app.route("/api/v1/sessions/<int:session_id>/messages/react", methods=["POST"])
+def api_react_message(session_id):
+    u, err = api_user()
+    if err: return err
+    row = api_owned_session(u, session_id)
+    if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
+    data = request.get_json(silent=True) or {}
+    peer_id = data.get("peer_id")
+    username = (data.get("username") or "").strip().lstrip("@")
+    msg_id = data.get("message_id")
+    emoji = data.get("emoji")
+    target = int(peer_id) if peer_id else username
+    try:
+        return jsonify(tg_core.react_message(row, target, msg_id, emoji=emoji, fallback_username=username))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/v1/sessions/<int:session_id>/messages/edit", methods=["POST"])
+def api_edit_message(session_id):
+    u, err = api_user()
+    if err: return err
+    row = api_owned_session(u, session_id)
+    if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
+    data = request.get_json(silent=True) or {}
+    peer_id = data.get("peer_id")
+    username = (data.get("username") or "").strip().lstrip("@")
+    msg_id = data.get("message_id")
+    new_text = data.get("text") or ""
+    target = int(peer_id) if peer_id else username
+    try:
+        return jsonify(tg_core.edit_message(row, target, msg_id, new_text, fallback_username=username))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/v1/sessions/<int:session_id>/messages/delete", methods=["POST"])
+def api_delete_messages(session_id):
+    u, err = api_user()
+    if err: return err
+    row = api_owned_session(u, session_id)
+    if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
+    data = request.get_json(silent=True) or {}
+    peer_id = data.get("peer_id")
+    username = (data.get("username") or "").strip().lstrip("@")
+    msg_ids = data.get("message_ids") or []
+    revoke = data.get("revoke", True)
+    target = int(peer_id) if peer_id else username
+    try:
+        return jsonify(tg_core.delete_messages(row, target, msg_ids, revoke=revoke, fallback_username=username))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/v1/sessions/<int:session_id>/messages/forward", methods=["POST"])
+def api_forward_messages(session_id):
+    u, err = api_user()
+    if err: return err
+    row = api_owned_session(u, session_id)
+    if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
+    data = request.get_json(silent=True) or {}
+    from_peer = data.get("from_peer_id") or data.get("from_username")
+    to_peer = data.get("to_peer_id") or data.get("to_username")
+    msg_ids = data.get("message_ids") or []
+    try:
+        return jsonify(tg_core.forward_messages(
+            row, from_peer, to_peer, msg_ids,
+            fallback_from_username=data.get("from_username"),
+            fallback_to_username=data.get("to_username"),
+        ))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/v1/sessions/<int:session_id>/messages/pin", methods=["POST"])
+def api_pin_message(session_id):
+    u, err = api_user()
+    if err: return err
+    row = api_owned_session(u, session_id)
+    if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
+    data = request.get_json(silent=True) or {}
+    peer_id = data.get("peer_id")
+    username = (data.get("username") or "").strip().lstrip("@")
+    msg_id = data.get("message_id")
+    unpin = bool(data.get("unpin", False))
+    target = int(peer_id) if peer_id else username
+    try:
+        return jsonify(tg_core.pin_message(row, target, msg_id, unpin=unpin, fallback_username=username))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/v1/sessions/<int:session_id>/messages/read", methods=["POST"])
+def api_mark_read(session_id):
+    u, err = api_user()
+    if err: return err
+    row = api_owned_session(u, session_id)
+    if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
+    data = request.get_json(silent=True) or {}
+    peer_id = data.get("peer_id")
+    username = (data.get("username") or "").strip().lstrip("@")
+    target = int(peer_id) if peer_id else username
+    if not target:
+        return jsonify({"ok": False, "error": "Provide peer_id or username."}), 400
+    try:
+        return jsonify(tg_core.mark_read(row, target, fallback_username=username))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
 
 
 @app.route("/api/v1/sessions/<int:session_id>/me/profile")
@@ -1334,10 +1533,11 @@ def api_profile(session_id):
     row = api_owned_session(u, session_id)
     if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
     peer = request.args.get("peer") or request.args.get("username")
+    fallback_username = request.args.get("username")
     if not peer:
         return jsonify({"ok": False, "error": "Provide ?peer=<id> or ?username=<username>."}), 400
     try:
-        return jsonify({"ok": True, "profile": tg_core.get_profile(row, peer)})
+        return jsonify({"ok": True, "profile": tg_core.get_profile(row, peer, fallback_username=fallback_username)})
     except Exception as e:
         return jsonify({"ok": False, "error": (str(e) or e.__class__.__name__ or "Telegram request failed")}), 500
 

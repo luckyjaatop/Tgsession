@@ -42,10 +42,17 @@ from telethon.tl.functions.contacts import (
 )
 from telethon.tl.functions.photos import UploadProfilePhotoRequest
 from telethon.tl.functions.channels import JoinChannelRequest, GetFullChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest, GetCustomEmojiDocumentsRequest, GetFullChatRequest
+from telethon.tl.functions.messages import (
+    ImportChatInviteRequest, GetCustomEmojiDocumentsRequest, GetFullChatRequest,
+    SendReactionRequest, GetAllStickersRequest, GetStickerSetRequest,
+    GetRecentStickersRequest, ForwardMessagesRequest, PinMessageRequest
+)
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.errors import FloodWaitError
-from telethon.tl.types import PeerUser, PeerChat, PeerChannel, MessageEntityCustomEmoji, InputPhoneContact
+from telethon.tl.types import (
+    PeerUser, PeerChat, PeerChannel, MessageEntityCustomEmoji, InputPhoneContact,
+    InputDocument, InputStickerSetID, ReactionEmoji, DocumentAttributeSticker
+)
 from telethon.utils import get_peer_id
 
 API_ID = int(os.environ.get("TELEGRAM_API_ID", "38785545"))
@@ -445,13 +452,13 @@ def fetch_otp(session_row):
 
 
 @_serialized_telegram
-def send_message(session_row, target, text):
+def send_message(session_row, target, text, reply_to=None, fallback_username=None):
     """Send a text message from this session's account to `target`, which can
     be a @username (str) or an existing dialog's peer id (int)."""
     cl = get_client(session_row)
 
     async def _f():
-        entity = await _resolve_entity_async(cl, target)
+        entity = await _resolve_entity_async(cl, target, fallback_username=fallback_username)
         cls = entity.__class__.__name__.lower()
         is_broadcast_channel = bool(cls.endswith("channel") and not getattr(entity, "megagroup", False))
         if is_broadcast_channel:
@@ -467,7 +474,7 @@ def send_message(session_row, target, text):
             if not allowed:
                 raise PermissionError("You cannot send messages in this channel because this account is not an admin with posting permission.")
 
-        msg = await cl.send_message(entity, text)
+        msg = await cl.send_message(entity, text, reply_to=(int(reply_to) if reply_to else None))
         is_group = bool(getattr(entity, "megagroup", False) or cls.endswith("chat"))
         return {
             "message_id": msg.id,
@@ -586,7 +593,7 @@ def _entity_summary(entity):
     }
 
 
-async def _resolve_entity_async(cl, peer_ref):
+async def _resolve_entity_async(cl, peer_ref, fallback_username=None):
     peer_ref = _normalize_peer(peer_ref)
     try:
         return await cl.get_entity(peer_ref)
@@ -602,13 +609,24 @@ async def _resolve_entity_async(cl, peer_ref):
                     except Exception:
                         pass
                 else:
-                    # Telethon's marked channel/group IDs are normally cached
-                    # after get_dialogs(); these explicit peers are a final try.
                     for candidate in (PeerChannel(peer_ref), PeerChat(peer_ref)):
                         try:
                             return await cl.get_entity(candidate)
                         except Exception:
                             pass
+            uname = (fallback_username or "").strip().lstrip("@")
+            if uname:
+                try:
+                    return await cl.get_entity(uname)
+                except Exception:
+                    try:
+                        res = await cl(ResolveUsernameRequest(uname))
+                        users = getattr(res, "users", None) or []
+                        chats = getattr(res, "chats", None) or []
+                        if users or chats:
+                            return (users + chats)[0]
+                    except Exception:
+                        pass
             raise
 
 
@@ -692,7 +710,32 @@ def _message_buttons(m):
     return out
 
 
-def _message_dict(m, is_group=False):
+def _sticker_emoji_alt(m):
+    doc = getattr(getattr(m, "media", None), "document", None) or getattr(m, "document", None)
+    for attr in (getattr(doc, "attributes", None) or []):
+        if isinstance(attr, DocumentAttributeSticker) or getattr(attr, "alt", None):
+            alt = getattr(attr, "alt", None)
+            if alt:
+                return str(alt)
+    return None
+
+
+def _message_reactions_list(m):
+    out = []
+    rx = getattr(m, "reactions", None)
+    for res in (getattr(rx, "results", None) or []):
+        reaction = getattr(res, "reaction", None)
+        emoji = getattr(reaction, "emoticon", None)
+        if emoji:
+            out.append({
+                "emoji": str(emoji),
+                "count": int(getattr(res, "count", 1) or 1),
+                "chosen": getattr(res, "chosen_order", None) is not None,
+            })
+    return out
+
+
+def _message_dict(m, is_group=False, reply_lookup=None):
     media, mime, name = _message_media_info(m)
     sender = getattr(m, "sender", None)
     sender_id = sender_name = sender_username = sender_has_photo = None
@@ -704,14 +747,27 @@ def _message_dict(m, is_group=False):
     custom_emojis = []
     for ent in getattr(m, "entities", None) or []:
         if isinstance(ent, MessageEntityCustomEmoji):
-            # Telegram offsets/lengths are UTF-16 code-unit offsets, which
-            # match JavaScript string indexing.
             custom_emojis.append({
                 "offset": int(ent.offset),
                 "length": int(ent.length),
                 "document_id": str(ent.document_id),
                 "alt": (m.text or "")[int(ent.offset):int(ent.offset)+int(ent.length)],
             })
+    reply_header = getattr(m, "reply_to", None)
+    reply_to_msg_id = getattr(reply_header, "reply_to_msg_id", None) if reply_header else None
+    reply_to_text = None
+    reply_to_sender = None
+    if reply_to_msg_id and reply_lookup and int(reply_to_msg_id) in reply_lookup:
+        rm = reply_lookup[int(reply_to_msg_id)]
+        r_media, _, _ = _message_media_info(rm)
+        reply_to_text = (rm.text or "").strip() or (f"[{r_media}]" if r_media else "Message")
+        if len(reply_to_text) > 90:
+            reply_to_text = reply_to_text[:87] + "..."
+        if getattr(rm, "out", False):
+            reply_to_sender = "You"
+        else:
+            _, r_sname, _, _ = _sender_fields(getattr(rm, "sender", None))
+            reply_to_sender = r_sname if r_sname and r_sname != "Unknown" else None
     return {
         "id": m.id,
         "text": m.text or "",
@@ -720,11 +776,19 @@ def _message_dict(m, is_group=False):
         "media_type": media,
         "mime_type": mime,
         "file_name": name,
+        "has_media": bool(media),
+        "sticker_emoji": _sticker_emoji_alt(m) if media and "sticker" in media else None,
         "sender_id": sender_id,
         "sender_name": sender_name,
         "sender_username": sender_username,
         "sender_has_photo": bool(sender_has_photo),
         "is_group_message": bool(is_group),
+        "edited": bool(getattr(m, "edit_date", None)),
+        "views": getattr(m, "views", None),
+        "reply_to_msg_id": int(reply_to_msg_id) if reply_to_msg_id else None,
+        "reply_to_text": reply_to_text,
+        "reply_to_sender": reply_to_sender,
+        "reactions": _message_reactions_list(m),
         "custom_emojis": custom_emojis,
         "buttons": _message_buttons(m),
     }
@@ -769,50 +833,54 @@ def click_message_button(session_row, peer_ref, message_id, row, col):
 
 
 @_serialized_telegram
-def get_messages(session_row, peer_ref, limit=60, after_id=None):
+def get_messages(session_row, peer_ref, limit=60, after_id=None, fallback_username=None):
     """Return recent Telegram history, including group sender metadata and
     sticker/custom-emoji information."""
     cl = get_client(session_row)
     peer_ref = _normalize_peer(peer_ref)
 
     async def _f():
-        entity = await _resolve_entity_async(cl, peer_ref)
+        entity = await _resolve_entity_async(cl, peer_ref, fallback_username=fallback_username)
         kwargs = {"limit": min(int(limit), 100)}
         if after_id is not None:
             kwargs["min_id"] = int(after_id)
         msgs = await cl.get_messages(entity, **kwargs)
+        msg_list = list(msgs or [])
+        reply_lookup = {m.id: m for m in msg_list if getattr(m, "id", None)}
         is_group = bool(getattr(entity, "megagroup", False) or entity.__class__.__name__.lower().endswith("chat"))
         out = []
-        for m in reversed(list(msgs or [])):
+        for m in reversed(msg_list):
             if is_group and not m.out:
                 try:
                     await m.get_sender()
                 except Exception:
                     pass
-            out.append(_message_dict(m, is_group=is_group))
+            out.append(_message_dict(m, is_group=is_group, reply_lookup=reply_lookup))
         return out
 
     return run_async(_f(), timeout=60)
 
 
 @_serialized_telegram
-def get_messages_bundle(session_row, peer_ref, limit=60):
+def get_messages_bundle(session_row, peer_ref, limit=60, fallback_username=None):
     """Return messages plus lightweight peer membership/posting metadata in one Telethon call."""
     cl = get_client(session_row)
     peer_ref = _normalize_peer(peer_ref)
 
     async def _f():
-        entity = await _resolve_entity_async(cl, peer_ref)
+        entity = await _resolve_entity_async(cl, peer_ref, fallback_username=fallback_username)
         msgs = await cl.get_messages(entity, limit=min(int(limit), 100))
+        msg_list = list(msgs or [])
+        reply_lookup = {m.id: m for m in msg_list if getattr(m, "id", None)}
         is_group = bool(getattr(entity, "megagroup", False) or entity.__class__.__name__.lower().endswith("chat"))
         out = []
-        for m in reversed(list(msgs or [])):
+        for m in reversed(msg_list):
             if is_group and not m.out:
                 try:
                     await m.get_sender()
                 except Exception:
                     pass
-            out.append(_message_dict(m, is_group=is_group))
+            out.append(_message_dict(m, is_group=is_group, reply_lookup=reply_lookup))
         peer_info = _entity_summary(entity)
         can_send = True
         is_member = peer_info.get("is_member", True)
@@ -876,29 +944,308 @@ def resolve_peer(session_row, target):
     return run_async(_f(), timeout=30)
 
 
+def _sniff_image_mime(data, default_mime="application/octet-stream"):
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:2] == b"\xff\xd8":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return default_mime
+
+
 @_serialized_telegram
-def download_media(session_row, peer_ref, message_id):
-    """Download one Telegram message's media and return (bytes, mime, filename)."""
+def download_media(session_row, peer_ref, message_id, thumb=False, fallback_username=None):
+    """Download one Telegram message's media (or thumbnail for stickers/videos) and return (bytes, mime, filename)."""
     cl = get_client(session_row)
     peer_ref = _normalize_peer(peer_ref)
     message_id = int(message_id)
 
     async def _f():
         from io import BytesIO
-        entity = await _resolve_entity_async(cl, peer_ref)
+        entity = await _resolve_entity_async(cl, peer_ref, fallback_username=fallback_username)
         msg = await cl.get_messages(entity, ids=message_id)
         if not msg or not msg.media:
             raise ValueError("This message has no media.")
-        buf = BytesIO()
-        await cl.download_media(msg, file=buf)
-        data = buf.getvalue()
-        if not data:
-            raise ValueError("Telegram returned empty media.")
         mime = getattr(getattr(msg, "file", None), "mime_type", None) or "application/octet-stream"
         name = getattr(getattr(msg, "file", None), "name", None) or f"telegram-{message_id}"
+        is_animated_sticker = ("tgsticker" in mime) or (mime == "video/webm") or name.lower().endswith(".webm")
+        buf = BytesIO()
+        data = b""
+        if thumb or is_animated_sticker:
+            for t in (-1, 0):
+                try:
+                    tbuf = BytesIO()
+                    await cl.download_media(msg, file=tbuf, thumb=t)
+                    if tbuf.getvalue():
+                        data = tbuf.getvalue()
+                        mime = _sniff_image_mime(data, "image/webp")
+                        break
+                except Exception:
+                    pass
+        if not data and not (thumb and is_animated_sticker):
+            await cl.download_media(msg, file=buf)
+            data = buf.getvalue()
+            if mime == "application/octet-stream" and data:
+                mime = _sniff_image_mime(data, mime)
+        if not data:
+            raise ValueError("Telegram returned empty media.")
         return data, mime, name
 
     return run_async(_f(), timeout=120)
+
+
+@_serialized_telegram
+def send_media(session_row, target, file_bytes, filename, caption="", force_document=False, reply_to=None, fallback_username=None):
+    """Upload and send a photo, video, or document to a Telegram chat."""
+    cl = get_client(session_row)
+
+    async def _f():
+        entity = await _resolve_entity_async(cl, target, fallback_username=fallback_username)
+        cls = entity.__class__.__name__.lower()
+        is_broadcast_channel = bool(cls.endswith("channel") and not getattr(entity, "megagroup", False))
+        if is_broadcast_channel:
+            try:
+                perms = await cl.get_permissions(entity, "me")
+                admin_rights = getattr(perms, "admin_rights", None)
+                allowed = bool(
+                    getattr(perms, "is_creator", False)
+                    or (getattr(perms, "is_admin", False) and admin_rights is not None and getattr(admin_rights, "post_messages", False))
+                )
+            except Exception:
+                allowed = False
+            if not allowed:
+                raise PermissionError("You cannot post media in this channel.")
+        ext = os.path.splitext(filename or "upload.bin")[1] or ".bin"
+        tmp = tempfile.mktemp(suffix=ext)
+        with open(tmp, "wb") as f:
+            f.write(file_bytes)
+        try:
+            msg = await cl.send_file(
+                entity,
+                tmp,
+                caption=(caption or None),
+                force_document=bool(force_document),
+                reply_to=(int(reply_to) if reply_to else None),
+            )
+            is_group = bool(getattr(entity, "megagroup", False) or cls.endswith("chat"))
+            return {
+                "message_id": msg.id,
+                "message": _message_dict(msg, is_group=is_group),
+            }
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    return run_async(_f(), timeout=120)
+
+
+def _sticker_doc_dict(doc):
+    alt = None
+    for attr in (getattr(doc, "attributes", None) or []):
+        if isinstance(attr, DocumentAttributeSticker) or getattr(attr, "alt", None):
+            alt = getattr(attr, "alt", None)
+            if alt:
+                break
+    return {
+        "id": str(doc.id),
+        "access_hash": str(doc.access_hash),
+        "file_reference": base64.urlsafe_b64encode(getattr(doc, "file_reference", b"") or b"").decode("ascii"),
+        "emoji": str(alt) if alt else "",
+        "mime_type": getattr(doc, "mime_type", None) or "image/webp",
+    }
+
+
+@_serialized_telegram
+def get_stickers(session_row):
+    """Return user's recent Telegram stickers and top installed sticker packs."""
+    cl = get_client(session_row)
+
+    async def _f():
+        recent_out = []
+        try:
+            recent_res = await cl(GetRecentStickersRequest(hash=0))
+            for doc in (getattr(recent_res, "stickers", None) or [])[:24]:
+                if getattr(doc, "id", None) and getattr(doc, "access_hash", None) is not None:
+                    recent_out.append(_sticker_doc_dict(doc))
+        except Exception:
+            pass
+
+        packs_out = []
+        try:
+            all_sets = await cl(GetAllStickersRequest(hash=0))
+            for s in (getattr(all_sets, "sets", None) or [])[:6]:
+                try:
+                    full_set = await cl(GetStickerSetRequest(
+                        stickerset=InputStickerSetID(id=s.id, access_hash=s.access_hash),
+                        hash=0,
+                    ))
+                    docs = [
+                        _sticker_doc_dict(d)
+                        for d in (getattr(full_set, "documents", None) or [])[:20]
+                        if getattr(d, "id", None) and getattr(d, "access_hash", None) is not None
+                    ]
+                    if docs:
+                        packs_out.append({
+                            "id": str(s.id),
+                            "title": getattr(s, "title", None) or "Stickers",
+                            "stickers": docs,
+                        })
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return {"recent": recent_out, "packs": packs_out}
+
+    return run_async(_f(), timeout=60)
+
+
+@_serialized_telegram
+def download_sticker_image(session_row, doc_id, access_hash, file_reference_b64=""):
+    cl = get_client(session_row)
+    doc_id = int(doc_id)
+    access_hash = int(access_hash)
+
+    async def _f():
+        from io import BytesIO
+        raw_ref = b""
+        if file_reference_b64:
+            pad = "=" * ((4 - len(file_reference_b64) % 4) % 4)
+            raw_ref = base64.urlsafe_b64decode((file_reference_b64 + pad).encode("ascii"))
+        doc = InputDocument(id=doc_id, access_hash=access_hash, file_reference=raw_ref)
+        data = b""
+        for t in (-1, 0):
+            try:
+                tbuf = BytesIO()
+                await cl.download_media(doc, file=tbuf, thumb=t)
+                if tbuf.getvalue():
+                    data = tbuf.getvalue()
+                    break
+            except Exception:
+                pass
+        if not data:
+            fbuf = BytesIO()
+            await cl.download_media(doc, file=fbuf)
+            data = fbuf.getvalue()
+        if not data:
+            return None, None
+        mime = _sniff_image_mime(data, "image/webp")
+        return data, mime
+
+    return run_async(_f(), timeout=60)
+
+
+@_serialized_telegram
+def send_sticker(session_row, target, doc_id, access_hash, file_reference_b64="", reply_to=None, fallback_username=None):
+    cl = get_client(session_row)
+    doc_id = int(doc_id)
+    access_hash = int(access_hash)
+
+    async def _f():
+        entity = await _resolve_entity_async(cl, target, fallback_username=fallback_username)
+        raw_ref = b""
+        if file_reference_b64:
+            pad = "=" * ((4 - len(file_reference_b64) % 4) % 4)
+            raw_ref = base64.urlsafe_b64decode((file_reference_b64 + pad).encode("ascii"))
+        doc = InputDocument(id=doc_id, access_hash=access_hash, file_reference=raw_ref)
+        msg = await cl.send_file(entity, doc, reply_to=(int(reply_to) if reply_to else None))
+        cls = entity.__class__.__name__.lower()
+        is_group = bool(getattr(entity, "megagroup", False) or cls.endswith("chat"))
+        return {
+            "message_id": msg.id,
+            "message": _message_dict(msg, is_group=is_group),
+        }
+
+    return run_async(_f(), timeout=60)
+
+
+@_serialized_telegram
+def react_message(session_row, target, message_id, emoji=None, fallback_username=None):
+    cl = get_client(session_row)
+    message_id = int(message_id)
+
+    async def _f():
+        entity = await _resolve_entity_async(cl, target, fallback_username=fallback_username)
+        reactions = [ReactionEmoji(emoticon=emoji)] if emoji else []
+        await cl(SendReactionRequest(peer=entity, msg_id=message_id, reaction=reactions))
+        msgs = await cl.get_messages(entity, ids=message_id)
+        is_group = bool(getattr(entity, "megagroup", False) or entity.__class__.__name__.lower().endswith("chat"))
+        return {"ok": True, "message": _message_dict(msgs, is_group=is_group) if msgs else None}
+
+    return run_async(_f(), timeout=30)
+
+
+@_serialized_telegram
+def edit_message(session_row, target, message_id, new_text, fallback_username=None):
+    cl = get_client(session_row)
+    message_id = int(message_id)
+
+    async def _f():
+        entity = await _resolve_entity_async(cl, target, fallback_username=fallback_username)
+        msg = await cl.edit_message(entity, message_id, new_text)
+        is_group = bool(getattr(entity, "megagroup", False) or entity.__class__.__name__.lower().endswith("chat"))
+        return {"ok": True, "message": _message_dict(msg, is_group=is_group)}
+
+    return run_async(_f(), timeout=30)
+
+
+@_serialized_telegram
+def delete_messages(session_row, target, message_ids, revoke=True, fallback_username=None):
+    cl = get_client(session_row)
+
+    async def _f():
+        entity = await _resolve_entity_async(cl, target, fallback_username=fallback_username)
+        ids = [int(x) for x in (message_ids or [])]
+        await cl.delete_messages(entity, ids, revoke=bool(revoke))
+        return {"ok": True, "deleted": len(ids)}
+
+    return run_async(_f(), timeout=30)
+
+
+@_serialized_telegram
+def forward_messages(session_row, from_peer, to_peer, message_ids, fallback_from_username=None, fallback_to_username=None):
+    cl = get_client(session_row)
+
+    async def _f():
+        src = await _resolve_entity_async(cl, from_peer, fallback_username=fallback_from_username)
+        dst = await _resolve_entity_async(cl, to_peer, fallback_username=fallback_to_username)
+        ids = [int(x) for x in (message_ids or [])]
+        await cl.forward_messages(dst, ids, from_peer=src)
+        return {"ok": True, "forwarded": len(ids)}
+
+    return run_async(_f(), timeout=60)
+
+
+@_serialized_telegram
+def pin_message(session_row, target, message_id, unpin=False, fallback_username=None):
+    cl = get_client(session_row)
+    message_id = int(message_id)
+
+    async def _f():
+        entity = await _resolve_entity_async(cl, target, fallback_username=fallback_username)
+        if unpin:
+            await cl.unpin_message(entity, message_id)
+        else:
+            await cl.pin_message(entity, message_id, notify=False)
+        return {"ok": True}
+
+    return run_async(_f(), timeout=30)
+
+
+@_serialized_telegram
+def mark_read(session_row, target, fallback_username=None):
+    cl = get_client(session_row)
+
+    async def _f():
+        entity = await _resolve_entity_async(cl, target, fallback_username=fallback_username)
+        await cl.send_read_acknowledge(entity)
+        return {"ok": True}
+
+    return run_async(_f(), timeout=20)
 
 
 @_serialized_telegram
@@ -996,13 +1343,13 @@ def update_own_profile(session_row, first_name, last_name="", bio=""):
 
 
 @_serialized_telegram
-def get_profile(session_row, peer_ref):
+def get_profile(session_row, peer_ref, fallback_username=None):
     """Return Telegram-style profile/about information for a user, group or channel."""
     cl = get_client(session_row)
     peer_ref = _normalize_peer(peer_ref)
 
     async def _f():
-        entity = await _resolve_entity_async(cl, peer_ref)
+        entity = await _resolve_entity_async(cl, peer_ref, fallback_username=fallback_username)
         cls = entity.__class__.__name__.lower()
         is_user = hasattr(entity, "first_name")
         is_channel = cls.endswith("channel")
