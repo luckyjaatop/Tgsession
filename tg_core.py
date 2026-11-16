@@ -33,10 +33,18 @@ from telethon.errors import (
     SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError,
     PasswordHashInvalidError, PhoneNumberInvalidError, PhoneNumberBannedError
 )
+from telethon.password import compute_check
 from telethon.tl.functions.account import (
     GetAuthorizationsRequest, ResetAuthorizationRequest,
-    GetPasswordRequest, ResetPasswordRequest, UpdateProfileRequest, UpdateUsernameRequest
+    GetPasswordRequest, ResetPasswordRequest, UpdateProfileRequest, UpdateUsernameRequest,
+    UpdatePasswordSettingsRequest, ConfirmPasswordEmailRequest, ResendPasswordEmailRequest,
+    SendChangePhoneCodeRequest, ChangePhoneRequest
 )
+try:
+    from telethon.tl.functions.account import SendVerifyEmailCodeRequest, VerifyEmailRequest
+except ImportError:
+    SendVerifyEmailCodeRequest = None
+    VerifyEmailRequest = None
 from telethon.tl.functions.contacts import (
     GetContactsRequest, DeleteContactsRequest, GetBlockedRequest, UnblockRequest, SearchRequest, AddContactRequest, ImportContactsRequest, ResolveUsernameRequest
 )
@@ -58,8 +66,15 @@ except ImportError:
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.errors import FloodWaitError
 from telethon.tl.types import (
-    PeerUser, PeerChat, PeerChannel, MessageEntityCustomEmoji, InputPhoneContact
+    PeerUser, PeerChat, PeerChannel, MessageEntityCustomEmoji, InputPhoneContact,
+    InputCheckPasswordEmpty, CodeSettings
 )
+from telethon.tl.types.account import PasswordInputSettings
+try:
+    from telethon.tl.types import EmailVerifyPurposeLoginChange, EmailVerificationCode
+except ImportError:
+    EmailVerifyPurposeLoginChange = None
+    EmailVerificationCode = None
 try:
     from telethon.tl.types import (
         InputDocument, InputStickerSetID, ReactionEmoji, DocumentAttributeSticker
@@ -1719,20 +1734,163 @@ def set_2fa_password(session_row, current_password, new_password, hint=None):
 
 
 @_serialized_telegram
-def set_2fa_email(session_row, current_password, new_email):
-    """Change just the 2FA recovery email, keeping the password itself
-    unchanged — mirrors Telegram's own Settings > Privacy & Security >
-    Two-Step Verification > Change Recovery Email. Requires the current
-    2FA password, same as Telegram's own app requires."""
+def set_2fa_email(session_row, new_email, current_password=None):
+    """Update Login Email directly (without 2FA password) or update 2FA Recovery Email.
+    Tries direct Login Email verification first whenever no 2FA password is supplied,
+    then falls back to UpdatePasswordSettingsRequest with InputCheckPasswordEmpty when
+    2FA is off, or requests 2FA password only if Telegram strictly enforces it."""
+    clean_email = (new_email or "").strip()
+    if not clean_email or "@" not in clean_email or "." not in clean_email.split("@")[-1]:
+        raise ValueError("Please enter a valid email address.")
+    clean_pw = (current_password or "").strip() or None
     cl = get_client(session_row)
 
     async def _f():
-        await cl.edit_2fa(
-            current_password=current_password,
-            new_password=current_password,  # unchanged — only the email updates
-            email=new_email,
-        )
-        return True
+        pwd = await cl(GetPasswordRequest())
+        has_pw = bool(getattr(pwd, "has_password", False))
+
+        # Path 1: Direct Login Email verification flow (no 2FA password required)
+        if not clean_pw and SendVerifyEmailCodeRequest is not None and EmailVerifyPurposeLoginChange is not None:
+            try:
+                sent = await cl(SendVerifyEmailCodeRequest(
+                    purpose=EmailVerifyPurposeLoginChange(),
+                    email=clean_email,
+                ))
+                pattern = getattr(sent, "email_pattern", None) or clean_email
+                code_len = int(getattr(sent, "length", 6) or 6)
+                return {
+                    "code_required": True,
+                    "flow": "login_email",
+                    "email_pattern": pattern,
+                    "code_length": code_len,
+                    "message": f"Verification code ({code_len} digits) sent to {pattern}.",
+                }
+            except FloodWaitError as fw:
+                raise ValueError(f"Too many attempts. Please wait {fw.seconds} seconds.")
+            except Exception as e:
+                up = str(e).upper()
+                if "EMAIL_INVALID" in up:
+                    raise ValueError("Invalid email address format.")
+                if "EMAIL_NOT_ALLOWED" in up:
+                    raise ValueError("This email address is not allowed by Telegram.")
+                # If EMAIL_NOT_SETUP or similar, fall through to UpdatePasswordSettingsRequest
+                if "EMAIL_NOT_SETUP" not in up and "NOT_SETUP" not in up and not has_pw:
+                    pass
+                elif "EMAIL_NOT_SETUP" not in up and "NOT_SETUP" not in up and has_pw:
+                    # Wait: if another error occurred unrelated to setup, still try fallback if not set
+                    pass
+
+        # Path 2: Password Recovery Email (direct if 2FA is off, or with SRP check if 2FA is on)
+        if not has_pw:
+            check = InputCheckPasswordEmpty()
+        else:
+            if not clean_pw:
+                return {
+                    "password_required": True,
+                    "error": "This account has no Login Email configured yet. Enter your 2FA password once to set a recovery email.",
+                }
+            check = compute_check(pwd, clean_pw)
+
+        try:
+            await cl(UpdatePasswordSettingsRequest(
+                password=check,
+                new_settings=PasswordInputSettings(email=clean_email),
+            ))
+            return {
+                "code_required": False,
+                "flow": "password_email",
+                "email_pattern": clean_email,
+                "message": "Email updated successfully.",
+            }
+        except FloodWaitError as fw:
+            raise ValueError(f"Too many attempts. Please wait {fw.seconds} seconds.")
+        except Exception as e:
+            ename = e.__class__.__name__.lower()
+            emsg = str(e)
+            up = emsg.upper()
+            if "emailunconfirmed" in ename or "EMAIL_UNCONFIRMED" in up:
+                code_len = int(getattr(e, "code_length", 6) or 6)
+                return {
+                    "code_required": True,
+                    "flow": "password_email",
+                    "email_pattern": clean_email,
+                    "code_length": code_len,
+                    "message": f"Verification code ({code_len} digits) sent to {clean_email}.",
+                }
+            if "passwordhashinvalid" in ename or "PASSWORD_HASH_INVALID" in up:
+                raise ValueError("Incorrect Two-Step Verification password.")
+            if "emailinvalid" in ename or "EMAIL_INVALID" in up:
+                raise ValueError("Invalid email address format.")
+            if "emailnotallowed" in ename or "EMAIL_NOT_ALLOWED" in up:
+                raise ValueError("This email address is not allowed by Telegram.")
+            raise ValueError(emsg or "Could not update email.")
+
+    return run_async(_f())
+
+
+@_serialized_telegram
+def confirm_2fa_email(session_row, code, flow="login_email"):
+    clean_code = re.sub(r"\s+", "", (code or "").strip())
+    if not clean_code:
+        raise ValueError("Enter the verification code sent to your email.")
+    cl = get_client(session_row)
+
+    async def _f():
+        try:
+            if flow == "login_email" and VerifyEmailRequest is not None and EmailVerifyPurposeLoginChange is not None and EmailVerificationCode is not None:
+                await cl(VerifyEmailRequest(
+                    purpose=EmailVerifyPurposeLoginChange(),
+                    verification=EmailVerificationCode(code=clean_code),
+                ))
+            else:
+                await cl(ConfirmPasswordEmailRequest(code=clean_code))
+        except FloodWaitError as fw:
+            raise ValueError(f"Too many attempts. Please wait {fw.seconds} seconds.")
+        except Exception as e:
+            ename = e.__class__.__name__.lower()
+            emsg = str(e)
+            up = emsg.upper()
+            if "codeinvalid" in ename or "CODE_INVALID" in up:
+                raise ValueError("Invalid email verification code. Please check and try again.")
+            if "codeexpired" in ename or "CODE_EXPIRED" in up:
+                raise ValueError("Verification code expired. Please request a new code.")
+            raise ValueError(emsg or "Could not confirm email code.")
+
+        pwd = await cl(GetPasswordRequest())
+        return {
+            "enabled": bool(getattr(pwd, "has_password", False)),
+            "hint": getattr(pwd, "hint", "") or "",
+            "has_recovery": bool(getattr(pwd, "has_recovery", False)),
+            "login_email_pattern": getattr(pwd, "login_email_pattern", None) or "",
+            "email_unconfirmed_pattern": getattr(pwd, "email_unconfirmed_pattern", None) or "",
+            "message": "Email verified and updated successfully!",
+        }
+
+    return run_async(_f())
+
+
+@_serialized_telegram
+def resend_2fa_email(session_row, flow="password_email", email=None):
+    cl = get_client(session_row)
+
+    async def _f():
+        try:
+            if flow == "login_email" and email and SendVerifyEmailCodeRequest is not None and EmailVerifyPurposeLoginChange is not None:
+                sent = await cl(SendVerifyEmailCodeRequest(
+                    purpose=EmailVerifyPurposeLoginChange(),
+                    email=email.strip(),
+                ))
+                return {
+                    "email_pattern": getattr(sent, "email_pattern", None) or email.strip(),
+                    "code_length": int(getattr(sent, "length", 6) or 6),
+                    "message": "Verification code re-sent to your email.",
+                }
+            await cl(ResendPasswordEmailRequest())
+            return {"message": "Confirmation code re-sent to your email."}
+        except FloodWaitError as fw:
+            raise ValueError(f"Too many attempts. Please wait {fw.seconds} seconds.")
+        except Exception as e:
+            raise ValueError(str(e) or "Could not resend email verification code.")
 
     return run_async(_f())
 
@@ -1823,7 +1981,16 @@ def get_2fa_status(session_row):
     async def _f():
         try:
             pwd = await cl(GetPasswordRequest())
-            return {"enabled": pwd.has_password, "hint": getattr(pwd, "hint", "") or ""}
+            has_pw = bool(getattr(pwd, "has_password", False))
+            login_email = getattr(pwd, "login_email_pattern", None) or ""
+            unconfirmed = getattr(pwd, "email_unconfirmed_pattern", None) or ""
+            return {
+                "enabled": has_pw,
+                "hint": getattr(pwd, "hint", "") or "",
+                "has_recovery": bool(getattr(pwd, "has_recovery", False)),
+                "login_email_pattern": login_email,
+                "email_unconfirmed_pattern": unconfirmed,
+            }
         except Exception as e:
             return {"enabled": False, "hint": "", "error": str(e)}
 
@@ -2154,6 +2321,98 @@ def verify_phone_password(temp_session: str, api_id: int, api_hash: str, phone: 
                 pass
 
     return run_async(_verify_pw())
+
+
+@_serialized_telegram
+def start_change_phone(session_row, new_phone: str):
+    """Send Telegram's official OTP verification code to replace this account's phone number."""
+    clean_phone = _normalize_phone(new_phone)
+    cl = get_client(session_row)
+
+    async def _f():
+        try:
+            sent = await cl(SendChangePhoneCodeRequest(
+                phone_number=clean_phone,
+                settings=CodeSettings(
+                    allow_flashcall=False,
+                    current_number=False,
+                    allow_app_hash=False,
+                ),
+            ))
+            delivery = _delivery_label(sent)
+            return {
+                "phone": clean_phone,
+                "phone_code_hash": sent.phone_code_hash,
+                "delivery": delivery,
+                "timeout": int(getattr(sent, "timeout", 60) or 60),
+                "message": f"Telegram sent an OTP to {clean_phone} via {delivery}.",
+            }
+        except PhoneNumberInvalidError:
+            raise ValueError("Invalid phone number. Include country code (e.g. +919876543210).")
+        except PhoneNumberBannedError:
+            raise ValueError("This phone number is banned on Telegram.")
+        except FloodWaitError as fw:
+            raise ValueError(f"Too many attempts. Please wait {fw.seconds} seconds.")
+        except Exception as e:
+            msg = str(e)
+            up = msg.upper()
+            if "FRESH_CHANGE_PHONE_FORBIDDEN" in up:
+                raise ValueError("Telegram requires this session to be active for at least 24 hours before changing its phone number.")
+            if "PHONE_NUMBER_OCCUPIED" in up:
+                raise ValueError("This phone number is already linked to another Telegram account.")
+            if "PHONE_NUMBER_INVALID" in up:
+                raise ValueError("Invalid phone number format.")
+            raise ValueError(msg or "Could not initiate phone number change.")
+
+    return run_async(_f())
+
+
+@_serialized_telegram
+def confirm_change_phone(session_row, new_phone: str, phone_code_hash: str, code: str):
+    """Verify the Telegram OTP and replace the account's phone number."""
+    clean_phone = _normalize_phone(new_phone)
+    clean_code = re.sub(r"\s+", "", (code or "").strip())
+    if not phone_code_hash:
+        raise ValueError("Missing verification token. Please request a new code.")
+    if not clean_code:
+        raise ValueError("Please enter the verification code sent by Telegram.")
+
+    cl = get_client(session_row)
+
+    async def _f():
+        try:
+            await cl(ChangePhoneRequest(
+                phone_number=clean_phone,
+                phone_code_hash=phone_code_hash,
+                phone_code=clean_code,
+            ))
+        except PhoneCodeInvalidError:
+            raise ValueError("Invalid verification code. Please check the OTP and try again.")
+        except PhoneCodeExpiredError:
+            raise ValueError("This verification code expired. Please request a new code.")
+        except FloodWaitError as fw:
+            raise ValueError(f"Too many attempts. Please wait {fw.seconds} seconds.")
+        except Exception as e:
+            msg = str(e)
+            up = msg.upper()
+            if "PHONE_NUMBER_OCCUPIED" in up:
+                raise ValueError("This phone number is already linked to another Telegram account.")
+            if "FRESH_CHANGE_PHONE_FORBIDDEN" in up:
+                raise ValueError("Telegram requires this session to be active for at least 24 hours before changing its phone number.")
+            raise ValueError(msg or "Could not replace phone number.")
+
+        profile = await _fetch_own_profile_async(cl)
+        final_phone = profile.get("phone") or clean_phone
+        if final_phone and not str(final_phone).startswith("+"):
+            final_phone = "+" + str(final_phone)
+        db.update_session_phone(session_row["id"], final_phone, profile.get("name"))
+        return {
+            "phone": final_phone,
+            "profile": profile,
+            "message": f"Phone number replaced with {final_phone}.",
+        }
+
+    return run_async(_f())
 
 
 def export_session_formats(session_row):

@@ -1660,16 +1660,101 @@ def api_2fa_email(session_id):
     if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
 
     data = request.get_json(silent=True) or {}
-    current_password = data.get("current_password")
+    current_password = (data.get("current_password") or "").strip() or None
     new_email = (data.get("email") or "").strip()
-    if not current_password:
-        return jsonify({"ok": False, "error": "Provide 'current_password' — Telegram requires it to change the recovery email."}), 400
     if not new_email:
         return jsonify({"ok": False, "error": "Provide 'email'."}), 400
 
     try:
-        tg_core.set_2fa_email(row, current_password, new_email)
-        return jsonify({"ok": True, "message": "Recovery email updated. Check the inbox for Telegram's confirmation code if prompted."})
+        res = tg_core.set_2fa_email(row, new_email=new_email, current_password=current_password)
+        if isinstance(res, dict) and res.get("password_required"):
+            return jsonify({"ok": False, "password_required": True, "error": res.get("error")}), 400
+        if isinstance(res, dict):
+            return jsonify({"ok": True, **res})
+        return jsonify({"ok": True, "message": "Email updated."})
+    except ValueError as ve:
+        return jsonify({"ok": False, "error": str(ve)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": (str(e) or e.__class__.__name__ or "Telegram request failed")}), 500
+
+
+@app.route("/api/v1/sessions/<int:session_id>/2fa/email/confirm", methods=["POST"])
+def api_2fa_email_confirm(session_id):
+    u, err = api_user()
+    if err: return err
+    row = api_owned_session(u, session_id)
+    if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
+
+    data = request.get_json(silent=True) or {}
+    code = (data.get("code") or "").strip()
+    flow = (data.get("flow") or "login_email").strip()
+    if not code:
+        return jsonify({"ok": False, "error": "Provide email verification 'code'."}), 400
+
+    try:
+        res = tg_core.confirm_2fa_email(row, code=code, flow=flow)
+        return jsonify({"ok": True, **res})
+    except ValueError as ve:
+        return jsonify({"ok": False, "error": str(ve)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": (str(e) or e.__class__.__name__ or "Telegram request failed")}), 500
+
+
+@app.route("/api/v1/sessions/<int:session_id>/2fa/email/resend", methods=["POST"])
+def api_2fa_email_resend(session_id):
+    u, err = api_user()
+    if err: return err
+    row = api_owned_session(u, session_id)
+    if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
+
+    data = request.get_json(silent=True) or {}
+    flow = (data.get("flow") or "password_email").strip()
+    email = (data.get("email") or "").strip() or None
+    try:
+        res = tg_core.resend_2fa_email(row, flow=flow, email=email)
+        return jsonify({"ok": True, **res})
+    except Exception as e:
+        return jsonify({"ok": False, "error": (str(e) or e.__class__.__name__ or "Telegram request failed")}), 400
+
+
+@app.route("/api/v1/sessions/<int:session_id>/phone/change/start", methods=["POST"])
+def api_phone_change_start(session_id):
+    u, err = api_user()
+    if err: return err
+    row = api_owned_session(u, session_id)
+    if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
+
+    data = request.get_json(silent=True) or {}
+    phone = (data.get("phone") or "").strip()
+    if not phone:
+        return jsonify({"ok": False, "error": "Provide the new phone number with country code."}), 400
+    try:
+        res = tg_core.start_change_phone(row, phone)
+        return jsonify({"ok": True, **res})
+    except ValueError as ve:
+        return jsonify({"ok": False, "error": str(ve)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": (str(e) or e.__class__.__name__ or "Telegram request failed")}), 500
+
+
+@app.route("/api/v1/sessions/<int:session_id>/phone/change/confirm", methods=["POST"])
+def api_phone_change_confirm(session_id):
+    u, err = api_user()
+    if err: return err
+    row = api_owned_session(u, session_id)
+    if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
+
+    data = request.get_json(silent=True) or {}
+    phone = (data.get("phone") or "").strip()
+    phone_code_hash = (data.get("phone_code_hash") or "").strip()
+    code = (data.get("code") or "").strip()
+    if not phone or not phone_code_hash or not code:
+        return jsonify({"ok": False, "error": "Provide 'phone', 'phone_code_hash', and 'code'."}), 400
+    try:
+        res = tg_core.confirm_change_phone(row, phone, phone_code_hash, code)
+        return jsonify({"ok": True, **res})
+    except ValueError as ve:
+        return jsonify({"ok": False, "error": str(ve)}), 400
     except Exception as e:
         return jsonify({"ok": False, "error": (str(e) or e.__class__.__name__ or "Telegram request failed")}), 500
 

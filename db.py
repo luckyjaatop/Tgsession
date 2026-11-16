@@ -320,6 +320,13 @@ def update_session_string(session_id, new_string):
     _get_db().tg_sessions.update_one({"id": int(session_id)}, {"$set": {"session_string": new_string}})
 
 
+def update_session_phone(session_id, new_phone, new_name=None):
+    updates = {"phone": new_phone}
+    if new_name:
+        updates["name"] = new_name
+    _get_db().tg_sessions.update_one({"id": int(session_id)}, {"$set": updates})
+
+
 # ───────────────────────── stats / broadcasts ─────────────────────────
 
 def stats():
