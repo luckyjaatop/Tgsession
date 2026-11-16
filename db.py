@@ -55,7 +55,7 @@ def _next_id(name):
 
 
 
-def acquire_session_lease(session_id, owner, ttl_seconds=180):
+def acquire_session_lease(session_id, owner, ttl_seconds=45):
     """Acquire a distributed MongoDB lease for a Telegram session.
 
     This prevents the same Telegram auth key from being connected from two
@@ -63,12 +63,13 @@ def acquire_session_lease(session_id, owner, ttl_seconds=180):
     """
     database = _get_db()
     sid = int(session_id)
-    expires = datetime.now(timezone.utc) + timedelta(seconds=int(ttl_seconds))
+    now_utc = datetime.now(timezone.utc)
+    expires = now_utc + timedelta(seconds=int(ttl_seconds))
     doc = database.tg_session_locks.find_one_and_update(
         {
             "_id": sid,
             "$or": [
-                {"expires_at": {"$lte": expires}},
+                {"expires_at": {"$lte": now_utc}},
                 {"owner": owner},
                 {"owner": {"$exists": False}},
             ],

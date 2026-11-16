@@ -1728,13 +1728,24 @@ def api_phone_change_start(session_id):
     phone = (data.get("phone") or "").strip()
     if not phone:
         return jsonify({"ok": False, "error": "Provide the new phone number with country code."}), 400
-    try:
-        res = tg_core.start_change_phone(row, phone)
-        return jsonify({"ok": True, **res})
-    except ValueError as ve:
-        return jsonify({"ok": False, "error": str(ve)}), 400
-    except Exception as e:
-        return jsonify({"ok": False, "error": (str(e) or e.__class__.__name__ or "Telegram request failed")}), 500
+    last = None
+    for attempt in range(2):
+        try:
+            res = tg_core.start_change_phone(row, phone)
+            return jsonify({"ok": True, **res})
+        except ValueError as ve:
+            return jsonify({"ok": False, "error": str(ve)}), 400
+        except Exception as e:
+            last = e
+            if attempt == 0:
+                time.sleep(0.35)
+    e = last or RuntimeError("Could not send phone change OTP.")
+    msg = str(e) or (
+        "Telegram connection was interrupted while sending OTP. Please try again."
+        if "Cancelled" in e.__class__.__name__
+        else e.__class__.__name__
+    )
+    return jsonify({"ok": False, "error": msg}), 500
 
 
 @app.route("/api/v1/sessions/<int:session_id>/phone/change/confirm", methods=["POST"])
@@ -1750,13 +1761,24 @@ def api_phone_change_confirm(session_id):
     code = (data.get("code") or "").strip()
     if not phone or not phone_code_hash or not code:
         return jsonify({"ok": False, "error": "Provide 'phone', 'phone_code_hash', and 'code'."}), 400
-    try:
-        res = tg_core.confirm_change_phone(row, phone, phone_code_hash, code)
-        return jsonify({"ok": True, **res})
-    except ValueError as ve:
-        return jsonify({"ok": False, "error": str(ve)}), 400
-    except Exception as e:
-        return jsonify({"ok": False, "error": (str(e) or e.__class__.__name__ or "Telegram request failed")}), 500
+    last = None
+    for attempt in range(2):
+        try:
+            res = tg_core.confirm_change_phone(row, phone, phone_code_hash, code)
+            return jsonify({"ok": True, **res})
+        except ValueError as ve:
+            return jsonify({"ok": False, "error": str(ve)}), 400
+        except Exception as e:
+            last = e
+            if attempt == 0:
+                time.sleep(0.35)
+    e = last or RuntimeError("Could not replace phone number.")
+    msg = str(e) or (
+        "Telegram connection was interrupted while verifying OTP. Please try again."
+        if "Cancelled" in e.__class__.__name__
+        else e.__class__.__name__
+    )
+    return jsonify({"ok": False, "error": msg}), 500
 
 
 @app.route("/api/v1/sessions/<int:session_id>/devices")

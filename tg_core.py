@@ -436,7 +436,7 @@ def _serialized_telegram(fn):
             acquired = False
             while time.monotonic() < deadline:
                 try:
-                    acquired = db.acquire_session_lease(sid, owner, ttl_seconds=180)
+                    acquired = db.acquire_session_lease(sid, owner, ttl_seconds=45)
                 except Exception:
                     acquired = False
                 if acquired:
@@ -2323,48 +2323,125 @@ def verify_phone_password(temp_session: str, api_id: int, api_hash: str, phone: 
     return run_async(_verify_pw())
 
 
+async def _open_fresh_authorized_client(session_row):
+    """Open a fresh, verified TelegramClient directly inside the active event
+    loop without relying on any previously cached socket."""
+    ss = (session_row.get("session_string") or "").strip()
+    if not ss:
+        raise ValueError("This session is no longer valid (logged out or revoked on Telegram's side).")
+    last_transient = None
+    for aid, ahash in API_PAIRS:
+        cl = TelegramClient(StringSession(ss), aid, ahash)
+        try:
+            await cl.connect()
+            if await cl.is_user_authorized():
+                return cl
+            await cl.disconnect()
+        except asyncio.CancelledError as ce:
+            last_transient = ce
+            try:
+                await cl.disconnect()
+            except Exception:
+                pass
+        except (ConnectionError, OSError, TimeoutError) as ne:
+            last_transient = ne
+            try:
+                await cl.disconnect()
+            except Exception:
+                pass
+        except Exception as exc:
+            ename = exc.__class__.__name__.lower()
+            try:
+                await cl.disconnect()
+            except Exception:
+                pass
+            if any(x in ename for x in ("authkey", "sessionrevoked", "sessionexpired", "userdeactivated", "unauthorized")):
+                continue
+            last_transient = exc
+    if last_transient is not None:
+        raise RuntimeError("Could not connect to Telegram. Please try again.")
+    raise ValueError("This session is no longer valid (logged out or revoked on Telegram's side).")
+
+
 @_serialized_telegram
 def start_change_phone(session_row, new_phone: str):
     """Send Telegram's official OTP verification code to replace this account's phone number."""
     clean_phone = _normalize_phone(new_phone)
-    cl = get_client(session_row)
+    drop_client(session_row["id"])
 
     async def _f():
-        try:
-            sent = await cl(SendChangePhoneCodeRequest(
-                phone_number=clean_phone,
-                settings=CodeSettings(
-                    allow_flashcall=False,
-                    current_number=False,
-                    allow_app_hash=False,
-                ),
-            ))
-            delivery = _delivery_label(sent)
-            return {
-                "phone": clean_phone,
-                "phone_code_hash": sent.phone_code_hash,
-                "delivery": delivery,
-                "timeout": int(getattr(sent, "timeout", 60) or 60),
-                "message": f"Telegram sent an OTP to {clean_phone} via {delivery}.",
-            }
-        except PhoneNumberInvalidError:
-            raise ValueError("Invalid phone number. Include country code (e.g. +919876543210).")
-        except PhoneNumberBannedError:
-            raise ValueError("This phone number is banned on Telegram.")
-        except FloodWaitError as fw:
-            raise ValueError(f"Too many attempts. Please wait {fw.seconds} seconds.")
-        except Exception as e:
-            msg = str(e)
-            up = msg.upper()
-            if "FRESH_CHANGE_PHONE_FORBIDDEN" in up:
-                raise ValueError("Telegram requires this session to be active for at least 24 hours before changing its phone number.")
-            if "PHONE_NUMBER_OCCUPIED" in up:
-                raise ValueError("This phone number is already linked to another Telegram account.")
-            if "PHONE_NUMBER_INVALID" in up:
-                raise ValueError("Invalid phone number format.")
-            raise ValueError(msg or "Could not initiate phone number change.")
+        for attempt in range(3):
+            cl = None
+            try:
+                cl = await _open_fresh_authorized_client(session_row)
+                sent = await cl(SendChangePhoneCodeRequest(
+                    phone_number=clean_phone,
+                    settings=CodeSettings(
+                        allow_flashcall=False,
+                        current_number=False,
+                        allow_app_hash=False,
+                    ),
+                ))
+                delivery = _delivery_label(sent)
+                return {
+                    "phone": clean_phone,
+                    "phone_code_hash": sent.phone_code_hash,
+                    "delivery": delivery,
+                    "timeout": int(getattr(sent, "timeout", 60) or 60),
+                    "message": f"Telegram sent an OTP to {clean_phone} via {delivery}.",
+                }
+            except ValueError:
+                raise
+            except PhoneNumberInvalidError:
+                raise ValueError("Invalid phone number. Include country code (e.g. +919876543210).")
+            except PhoneNumberBannedError:
+                raise ValueError("This phone number is banned on Telegram.")
+            except FloodWaitError as fw:
+                raise ValueError(f"Too many attempts. Please wait {fw.seconds} seconds.")
+            except asyncio.CancelledError:
+                if attempt < 2:
+                    await asyncio.sleep(0.35 * (attempt + 1))
+                    continue
+                raise RuntimeError("Telegram connection was interrupted while sending OTP. Please try again.")
+            except (ConnectionError, OSError, TimeoutError):
+                if attempt < 2:
+                    await asyncio.sleep(0.35 * (attempt + 1))
+                    continue
+                raise RuntimeError("Telegram network connection dropped. Please try again.")
+            except Exception as e:
+                msg = str(e)
+                up = msg.upper()
+                ename = e.__class__.__name__.upper()
+                if "CANCELLED" in ename or "TIMEDOUT" in ename or "TIMEOUT" in ename:
+                    if attempt < 2:
+                        await asyncio.sleep(0.35 * (attempt + 1))
+                        continue
+                    raise RuntimeError("Telegram connection was interrupted while sending OTP. Please try again.")
+                if "FRESH_CHANGE_PHONE_FORBIDDEN" in up:
+                    raise ValueError("Telegram requires this session to be active for at least 24 hours before changing its phone number.")
+                if "PHONE_NUMBER_OCCUPIED" in up:
+                    raise ValueError("This phone number is already linked to another Telegram account.")
+                if "PHONE_NUMBER_INVALID" in up:
+                    raise ValueError("Invalid phone number format.")
+                if "PHONE_NUMBER_FLOOD" in up or "PHONE_PASSWORD_FLOOD" in up:
+                    raise ValueError("Too many change number attempts for this phone number. Please try again later.")
+                raise ValueError(msg or e.__class__.__name__ or "Could not initiate phone number change.")
+            finally:
+                if cl is not None:
+                    try:
+                        await cl.disconnect()
+                    except Exception:
+                        pass
+        raise RuntimeError("Could not reach Telegram to send verification code. Please try again.")
 
-    return run_async(_f())
+    try:
+        return run_async(_f())
+    except BaseException as exc:
+        if isinstance(exc, (ValueError, RuntimeError)):
+            raise
+        if "Cancelled" in exc.__class__.__name__:
+            raise RuntimeError("Telegram connection was interrupted while sending OTP. Please try again.")
+        raise RuntimeError(str(exc) or exc.__class__.__name__ or "Could not initiate phone number change.")
 
 
 @_serialized_telegram
@@ -2377,42 +2454,80 @@ def confirm_change_phone(session_row, new_phone: str, phone_code_hash: str, code
     if not clean_code:
         raise ValueError("Please enter the verification code sent by Telegram.")
 
-    cl = get_client(session_row)
+    drop_client(session_row["id"])
 
     async def _f():
-        try:
-            await cl(ChangePhoneRequest(
-                phone_number=clean_phone,
-                phone_code_hash=phone_code_hash,
-                phone_code=clean_code,
-            ))
-        except PhoneCodeInvalidError:
-            raise ValueError("Invalid verification code. Please check the OTP and try again.")
-        except PhoneCodeExpiredError:
-            raise ValueError("This verification code expired. Please request a new code.")
-        except FloodWaitError as fw:
-            raise ValueError(f"Too many attempts. Please wait {fw.seconds} seconds.")
-        except Exception as e:
-            msg = str(e)
-            up = msg.upper()
-            if "PHONE_NUMBER_OCCUPIED" in up:
-                raise ValueError("This phone number is already linked to another Telegram account.")
-            if "FRESH_CHANGE_PHONE_FORBIDDEN" in up:
-                raise ValueError("Telegram requires this session to be active for at least 24 hours before changing its phone number.")
-            raise ValueError(msg or "Could not replace phone number.")
+        for attempt in range(2):
+            cl = None
+            try:
+                cl = await _open_fresh_authorized_client(session_row)
+                await cl(ChangePhoneRequest(
+                    phone_number=clean_phone,
+                    phone_code_hash=phone_code_hash,
+                    phone_code=clean_code,
+                ))
+                profile = None
+                try:
+                    profile = await _fetch_own_profile_async(cl)
+                except BaseException:
+                    profile = {"phone": clean_phone, "name": session_row.get("name")}
+                final_phone = (profile or {}).get("phone") or clean_phone
+                if final_phone and not str(final_phone).startswith("+"):
+                    final_phone = "+" + str(final_phone)
+                db.update_session_phone(session_row["id"], final_phone, (profile or {}).get("name"))
+                return {
+                    "phone": final_phone,
+                    "profile": profile,
+                    "message": f"Phone number replaced with {final_phone}.",
+                }
+            except ValueError:
+                raise
+            except PhoneCodeInvalidError:
+                raise ValueError("Invalid verification code. Please check the OTP and try again.")
+            except PhoneCodeExpiredError:
+                raise ValueError("This verification code expired. Please request a new code.")
+            except FloodWaitError as fw:
+                raise ValueError(f"Too many attempts. Please wait {fw.seconds} seconds.")
+            except asyncio.CancelledError:
+                if attempt == 0:
+                    await asyncio.sleep(0.35)
+                    continue
+                raise RuntimeError("Telegram connection was interrupted while verifying OTP. Please try again.")
+            except (ConnectionError, OSError, TimeoutError):
+                if attempt == 0:
+                    await asyncio.sleep(0.35)
+                    continue
+                raise RuntimeError("Telegram network connection dropped. Please try again.")
+            except Exception as e:
+                msg = str(e)
+                up = msg.upper()
+                ename = e.__class__.__name__.upper()
+                if "CANCELLED" in ename or "TIMEDOUT" in ename or "TIMEOUT" in ename:
+                    if attempt == 0:
+                        await asyncio.sleep(0.35)
+                        continue
+                    raise RuntimeError("Telegram connection was interrupted while verifying OTP. Please try again.")
+                if "PHONE_NUMBER_OCCUPIED" in up:
+                    raise ValueError("This phone number is already linked to another Telegram account.")
+                if "FRESH_CHANGE_PHONE_FORBIDDEN" in up:
+                    raise ValueError("Telegram requires this session to be active for at least 24 hours before changing its phone number.")
+                raise ValueError(msg or e.__class__.__name__ or "Could not replace phone number.")
+            finally:
+                if cl is not None:
+                    try:
+                        await cl.disconnect()
+                    except Exception:
+                        pass
+        raise RuntimeError("Could not confirm phone number change. Please try again.")
 
-        profile = await _fetch_own_profile_async(cl)
-        final_phone = profile.get("phone") or clean_phone
-        if final_phone and not str(final_phone).startswith("+"):
-            final_phone = "+" + str(final_phone)
-        db.update_session_phone(session_row["id"], final_phone, profile.get("name"))
-        return {
-            "phone": final_phone,
-            "profile": profile,
-            "message": f"Phone number replaced with {final_phone}.",
-        }
-
-    return run_async(_f())
+    try:
+        return run_async(_f())
+    except BaseException as exc:
+        if isinstance(exc, (ValueError, RuntimeError)):
+            raise
+        if "Cancelled" in exc.__class__.__name__:
+            raise RuntimeError("Telegram connection was interrupted while verifying OTP. Please try again.")
+        raise RuntimeError(str(exc) or exc.__class__.__name__ or "Could not replace phone number.")
 
 
 def export_session_formats(session_row):
