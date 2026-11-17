@@ -6,11 +6,12 @@ import time
 import secrets
 import string
 import hashlib
+import hmac
 from functools import wraps
 
 from flask import (
     Flask, render_template, request, redirect, url_for, flash,
-    session as flask_session, jsonify, Response, abort, send_file
+    session as flask_session, jsonify, Response, abort, send_file, make_response
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -34,7 +35,7 @@ PLANS = {
     "15d": {"label": "15 Days",  "days": 15, "amount": 60.0, "featured": True},
     "1m":  {"label": "1 Month",  "days": 30, "amount": 100.0},
 }
-PREMIUM_MAX_SESSIONS = 3  # sessions granted per paid plan; adjust as needed
+PREMIUM_MAX_SESSIONS = None  # unlimited sessions for paid plans
 
 
 def fg_create_order(amount, ref, webhook_url=None):
@@ -126,7 +127,12 @@ def access_required(f):
 
 @app.context_processor
 def inject_user():
-    return {"current_user": current_user(), "has_access": db.has_access}
+    return {
+        "current_user": current_user(),
+        "has_access": db.has_access,
+        "is_paid_premium": db.is_paid_premium,
+        "effective_max_sessions": db.effective_max_sessions,
+    }
 
 
 def _hash_api_key(value):
@@ -143,12 +149,7 @@ def api_user():
     if not row:
         return None, (jsonify({"ok": False, "error": "Invalid or revoked API key."}), 401)
     if not db.has_access(row):
-        return None, (jsonify({"ok": False, "error": "Your account does not have active access."}), 403)
-    if not db.check_and_bind_api_key_ip(row["id"], get_client_ip()):
-        return None, (jsonify({
-            "ok": False,
-            "error": "This API key is already active on another device/network. Reset the device binding from the website's API page if this is you."
-        }), 409)
+        return None, (jsonify({"ok": False, "error": "Your account access has been disabled by admin."}), 403)
     db.touch_api_key(row["id"])
     return row, None
 
@@ -163,7 +164,7 @@ def api_owned_session(row, session_id):
 # ─────────────────────── auth routes ───────────────────────
 
 MAX_SIGNUPS_PER_IP = 1
-SIGNUP_WINDOW_DAYS = 30
+SIGNUP_COOKIE_NAME = "smp_reg_lock"
 
 
 def get_client_ip():
@@ -176,35 +177,61 @@ def get_client_ip():
     return request.remote_addr or "unknown"
 
 
+def _sign_reg_token(value):
+    key = (app.secret_key or "smp-secret").encode("utf-8")
+    sig = hmac.new(key, value.encode("utf-8"), hashlib.sha256).hexdigest()[:24]
+    return f"{value}.{sig}"
+
+
+def _has_valid_reg_cookie():
+    raw = request.cookies.get(SIGNUP_COOKIE_NAME, "")
+    if "." not in raw:
+        return False
+    value, sig = raw.rsplit(".", 1)
+    expected = _sign_reg_token(value).rsplit(".", 1)[1]
+    return hmac.compare_digest(sig, expected)
+
+
 @app.route("/register", methods=["GET", "POST"])
 def register():
     if current_user():
         return redirect(url_for("dashboard"))
+    ip = get_client_ip()
+    cookie_locked = _has_valid_reg_cookie()
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        # Honeypot: a field hidden from real users via CSS. Simple signup
-        # bots/scripts that fill every field in the form will trip it.
+        device_id = (request.form.get("device_id") or "").strip()[:120]
+        # Honeypot: a field hidden from real users via CSS.
         if request.form.get("website"):
-            flash("Account created! You've been given a 1-hour free trial. Log in to continue.", "success")
+            flash("Multi-account creation is disabled.", "danger")
             return redirect(url_for("login"))
 
-        ip = get_client_ip()
-        if not username or not password:
+        if cookie_locked or db.has_prior_registration(ip, device_id=device_id):
+            flash("Only 1 account is allowed per device/network. Please log in to your existing account.", "danger")
+        elif not username or not password:
             flash("Username and password are required.", "danger")
         elif len(password) < 6:
             flash("Password must be at least 6 characters.", "danger")
-        elif db.count_recent_registrations(ip, hours=24 * SIGNUP_WINDOW_DAYS) >= MAX_SIGNUPS_PER_IP:
-            flash("Only one free account is allowed per network per month. Please try again later.", "danger")
         else:
             ok = db.create_user(username, generate_password_hash(password))
             if not ok:
                 flash("That username is already taken.", "danger")
             else:
-                db.record_registration(ip)
-                flash("Account created! You've been given a 1-hour free trial. Log in to continue.", "success")
-                return redirect(url_for("login"))
-    return render_template("register.html")
+                db.record_registration(ip, device_id=device_id)
+                flash("Account created! Your free account allows 1 session and your API key will never expire. Log in to continue.", "success")
+                resp = make_response(redirect(url_for("login")))
+                token_val = device_id or secrets.token_hex(12)
+                resp.set_cookie(
+                    SIGNUP_COOKIE_NAME,
+                    _sign_reg_token(token_val),
+                    max_age=10 * 365 * 24 * 3600,
+                    httponly=True,
+                    samesite="Lax",
+                )
+                return resp
+    already_registered = cookie_locked or db.has_prior_registration(ip)
+    return render_template("register.html", already_registered=already_registered)
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -429,8 +456,9 @@ def billing_webhook():
 @access_required
 def sessions_add():
     u = current_user()
-    if db.count_sessions(u["id"]) >= u["max_sessions"] and not u["is_admin"]:
-        flash(f"Session limit reached ({u['max_sessions']}). Ask the admin to raise your limit.", "warning")
+    limit = db.effective_max_sessions(u)
+    if limit is not None and db.count_sessions(u["id"]) >= limit:
+        flash(f"Free plan allows only {limit} session. Upgrade to a paid plan for unlimited sessions.", "warning")
         return redirect(url_for("dashboard"))
 
     f = request.files.get("session_file")
@@ -467,10 +495,11 @@ def sessions_add_zip():
         flash("That doesn't look like a valid .zip file.", "danger")
         return redirect(url_for("dashboard"))
 
+    limit = db.effective_max_sessions(u)
     for name in names:
-        # Respect each user's session limit as we go (admins are unlimited)
-        if not u["is_admin"] and db.count_sessions(u["id"]) >= u["max_sessions"]:
-            results.append(f"⏭ {name}: skipped (session limit reached)")
+        # Free plan strictly capped at 1 session; paid/admin plans unlimited
+        if limit is not None and db.count_sessions(u["id"]) >= limit:
+            results.append(f"⏭ {name}: skipped (free plan 1-session limit reached — upgrade for unlimited)")
             continue
         try:
             raw_file = zf.read(name)
@@ -679,7 +708,9 @@ def give_message_stream(session_id):
 def api_me():
     u, err = api_user()
     if err: return err
-    return jsonify({"ok": True, "user": {"username": u["username"], "access": u["access"], "max_sessions": u["max_sessions"], "sessions": db.count_sessions(u["user_id"])}})
+    limit = db.effective_max_sessions(u)
+    effective_access = "premium" if db.is_paid_premium(u) else u["access"]
+    return jsonify({"ok": True, "user": {"username": u["username"], "access": effective_access, "max_sessions": limit, "sessions": db.count_sessions(u["user_id"])}})
 
 @app.route("/api/v1/sessions")
 def api_sessions():
@@ -775,8 +806,9 @@ def api_sessions_add():
     (field: session_file) or a JSON/form body with session_string."""
     u, err = api_user()
     if err: return err
-    if not u["is_admin"] and db.count_sessions(u["user_id"]) >= u["max_sessions"]:
-        return jsonify({"ok": False, "error": f"Session limit reached ({u['max_sessions']})."}), 403
+    limit = db.effective_max_sessions(u)
+    if limit is not None and db.count_sessions(u["user_id"]) >= limit:
+        return jsonify({"ok": False, "error": f"Free plan allows only {limit} session. Upgrade to a paid plan for unlimited sessions."}), 403
 
     raw, dc_hint = _extract_session_raw_and_dc()
     if not raw:
@@ -828,8 +860,9 @@ def api_sessions_add_zip():
     success, fail = 0, 0
     results = []
     for name in names:
-        if not u["is_admin"] and db.count_sessions(u["user_id"]) >= u["max_sessions"]:
-            results.append({"file": name, "ok": False, "error": "session limit reached"})
+        limit = db.effective_max_sessions(u)
+        if limit is not None and db.count_sessions(u["user_id"]) >= limit:
+            results.append({"file": name, "ok": False, "error": "Free plan allows only 1 session. Upgrade to a paid plan for unlimited sessions."})
             continue
         try:
             raw_file = zf.read(name)
@@ -850,8 +883,9 @@ def api_sessions_login_start():
     """Start phone + OTP login and store the pending Telethon pre-auth session in MongoDB."""
     u, err = api_user()
     if err: return err
-    if not u["is_admin"] and db.count_sessions(u["user_id"]) >= u["max_sessions"]:
-        return jsonify({"ok": False, "error": f"Session limit reached ({u['max_sessions']})."}), 403
+    limit = db.effective_max_sessions(u)
+    if limit is not None and db.count_sessions(u["user_id"]) >= limit:
+        return jsonify({"ok": False, "error": f"Free plan allows only {limit} session. Upgrade to a paid plan for unlimited sessions."}), 403
     data = request.get_json(silent=True) or {}
     phone = (data.get("phone") or request.form.get("phone") or "").strip()
     if not phone:
@@ -911,9 +945,10 @@ def api_sessions_login_code():
                 "hint": res.get("hint") or "",
             })
 
-        if not u["is_admin"] and db.count_sessions(u["user_id"]) >= u["max_sessions"]:
+        limit = db.effective_max_sessions(u)
+        if limit is not None and db.count_sessions(u["user_id"]) >= limit:
             db.delete_pending_login(token)
-            return jsonify({"ok": False, "error": f"Session limit reached ({u['max_sessions']})."}), 403
+            return jsonify({"ok": False, "error": f"Free plan allows only {limit} session. Upgrade to a paid plan for unlimited sessions."}), 403
 
         sid = db.add_session(u["user_id"], res["phone"], res["name"], res["session_string"])
         db.delete_pending_login(token)
@@ -955,9 +990,10 @@ def api_sessions_login_password():
             phone=pending["phone"],
             password=password,
         )
-        if not u["is_admin"] and db.count_sessions(u["user_id"]) >= u["max_sessions"]:
+        limit = db.effective_max_sessions(u)
+        if limit is not None and db.count_sessions(u["user_id"]) >= limit:
             db.delete_pending_login(token)
-            return jsonify({"ok": False, "error": f"Session limit reached ({u['max_sessions']})."}), 403
+            return jsonify({"ok": False, "error": f"Free plan allows only {limit} session. Upgrade to a paid plan for unlimited sessions."}), 403
 
         sid = db.add_session(u["user_id"], res["phone"], res["name"], res["session_string"])
         db.delete_pending_login(token)

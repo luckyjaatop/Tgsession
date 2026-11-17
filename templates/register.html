@@ -3,21 +3,39 @@
 {% block content %}
 <div class="card auth-card">
   <h2>Create Account</h2>
-  <form method="post">
-    <!-- Honeypot: hidden from real users, left unfilled. A bot that fills
-         every field in the form trips this and the signup is silently
-         dropped server-side. autocomplete=off + tabindex=-1 keep browsers
-         and keyboard users from ever landing on it. -->
-    <div style="position:absolute;left:-9999px;top:-9999px;" aria-hidden="true">
-      <label for="website">Leave this field blank</label>
-      <input type="text" id="website" name="website" tabindex="-1" autocomplete="off">
+  {% if already_registered %}
+    <div class="flash flash-warning" style="margin-bottom:14px;">
+      Only 1 account is allowed per device/network. Multi-account creation is disabled.
     </div>
-    <label>Username</label>
-    <input type="text" name="username" required autofocus>
-    <label>Password</label>
-    <input type="password" name="password" required minlength="6">
-    <button type="submit" class="btn btn-primary">Register</button>
-  </form>
-  <p class="muted">New accounts get a 1-hour free trial (1 session). <a href="{{ url_for('login') }}">Already have an account?</a></p>
+    <a href="{{ url_for('login') }}" class="btn btn-primary" style="display:block;text-align:center;">Go to Login</a>
+  {% else %}
+    <form method="post" id="regForm">
+      <!-- Honeypot: hidden from real users, left unfilled. -->
+      <div style="position:absolute;left:-9999px;top:-9999px;" aria-hidden="true">
+        <label for="website">Leave this field blank</label>
+        <input type="text" id="website" name="website" tabindex="-1" autocomplete="off">
+      </div>
+      <input type="hidden" id="device_id" name="device_id" value="">
+      <label>Username</label>
+      <input type="text" name="username" required autofocus>
+      <label>Password</label>
+      <input type="password" name="password" required minlength="6">
+      <button type="submit" class="btn btn-primary">Register</button>
+    </form>
+    <p class="muted">Free accounts include 1 session and a permanent API key (1 account per device/network). <a href="{{ url_for('login') }}">Already have an account?</a></p>
+    <script>
+      (function () {
+        let devId = localStorage.getItem('smp_device_id');
+        if (!devId) {
+          devId = (window.crypto && crypto.randomUUID)
+            ? crypto.randomUUID()
+            : ('dev_' + Math.random().toString(36).slice(2) + Date.now().toString(36));
+          localStorage.setItem('smp_device_id', devId);
+        }
+        const field = document.getElementById('device_id');
+        if (field) field.value = devId;
+      })();
+    </script>
+  {% endif %}
 </div>
 {% endblock %}

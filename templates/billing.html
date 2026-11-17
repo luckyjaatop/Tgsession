@@ -3,26 +3,26 @@
 {% block content %}
 <div class="card">
   <h2>⚡ Billing &amp; Plans</h2>
-  {% if access_ok %}
-    <p class="muted">Your account currently has active access
-      {% if current_user['access'] == 'premium' and current_user['premium_expires'] %}
-        — premium until <b>{{ current_user['premium_expires'] }}</b>.
-      {% elif current_user['access'] == 'premium' %}
-        — premium (no expiry).
-      {% elif current_user['access'] == 'trial' %}
-        — free trial until <b>{{ current_user['trial_expires'] }}</b>.
+  {% if is_paid_premium(current_user) %}
+    <p class="muted">Your account currently has <b>Paid Access (Unlimited Sessions)</b>
+      {% if current_user['premium_expires'] %}
+        — active until <b>{{ current_user['premium_expires'] }}</b>.
+      {% else %}
+        — permanent unlimited access.
       {% endif %}
     </p>
+  {% elif access_ok %}
+    <p class="muted">You are on the <b>Free Plan</b> (1 session max, API key never expires). Upgrade below for <b>Unlimited Sessions</b>.</p>
   {% else %}
-    <p class="muted">Your access has expired. Pick a plan below to continue.</p>
+    <p class="muted">Your access is disabled. Contact admin or pick a plan below.</p>
   {% endif %}
-
   <div class="plans-grid">
     {% for pid, p in plans.items() %}
       <div class="plan-card {% if p.get('featured') %}featured{% endif %}">
         {% if p.get('featured') %}<div class="plan-badge">POPULAR</div>{% endif %}
         <div class="plan-days">{{ p.label }}</div>
         <div class="plan-price">₹{{ p.amount|int }}</div>
+        <p class="muted" style="font-size:0.85em;margin:6px 0 12px;">Unlimited Sessions</p>
         <form method="post" action="{{ url_for('billing_buy', plan_id=pid) }}">
           <button class="btn btn-primary">Pay via UPI</button>
         </form>

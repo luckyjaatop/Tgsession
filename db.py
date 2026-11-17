@@ -12,6 +12,7 @@ database, so there's nothing to "open" on disk at all.
 Connection string is hardcoded below (MongoDB Atlas cluster, user ffg201592_db_user).
 """
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 from pymongo import MongoClient, ASCENDING, ReturnDocument
@@ -112,6 +113,7 @@ def init_db():
     database.redeem_codes.create_index([("code", ASCENDING)], unique=True)
     database.redeem_codes.create_index([("id", ASCENDING)], unique=True)
     database.registrations.create_index([("ip", ASCENDING), ("created_at", ASCENDING)])
+    database.registrations.create_index([("device_id", ASCENDING)])
     database.orders.create_index([("order_id", ASCENDING)], unique=True)
     database.orders.create_index([("user_id", ASCENDING)])
     database.pending_logins.create_index([("token", ASCENDING)], unique=True)
@@ -140,15 +142,23 @@ def init_db():
 
 def create_user(username, password_hash):
     database = _get_db()
+    clean_name = (username or "").strip()
+    if not clean_name:
+        return False
+    existing_ci = database.users.find_one(
+        {"username": {"$regex": f"^{re.escape(clean_name)}$", "$options": "i"}}
+    )
+    if existing_ci:
+        return False
     try:
         database.users.insert_one({
             "id": _next_id("users"),
-            "username": username,
+            "username": clean_name,
             "password_hash": password_hash,
             "is_admin": 0,
-            "access": "trial",
+            "access": "free",
             "max_sessions": 1,
-            "trial_expires": (datetime.now(timezone.utc) + timedelta(hours=1)).replace(tzinfo=None).isoformat(),
+            "trial_expires": None,
             "created_at": now(),
         })
         return True
@@ -157,19 +167,36 @@ def create_user(username, password_hash):
         return False
 
 
-def record_registration(ip):
-    """Log a signup's IP so repeat free-trial signups from the same network
-    can be rate-limited."""
-    _get_db().registrations.insert_one({
+def record_registration(ip, device_id=None):
+    """Log a signup's IP and device token so only one account can be created per device/network."""
+    doc = {
         "id": _next_id("registrations"),
         "ip": ip,
         "created_at": now(),
-    })
+    }
+    if device_id:
+        doc["device_id"] = str(device_id).strip()
+    _get_db().registrations.insert_one(doc)
 
 
 def count_recent_registrations(ip, hours=24):
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).replace(tzinfo=None).isoformat()
     return _get_db().registrations.count_documents({"ip": ip, "created_at": {"$gte": cutoff}})
+
+
+def has_prior_registration(ip, device_id=None):
+    """Return True if this IP or device token has already registered an account."""
+    database = _get_db()
+    clean_ip = (ip or "").strip()
+    clean_dev = (device_id or "").strip()
+    clauses = []
+    if clean_ip and clean_ip != "unknown":
+        clauses.append({"ip": clean_ip})
+    if clean_dev:
+        clauses.append({"device_id": clean_dev})
+    if not clauses:
+        return False
+    return database.registrations.count_documents({"$or": clauses}) > 0
 
 
 def get_user_by_username(username):
@@ -221,9 +248,7 @@ def grant_premium(uid, days, max_sessions=None):
         except Exception:
             pass
     new_exp = (base + timedelta(days=days)).isoformat()
-    update = {"access": "premium", "premium_expires": new_exp}
-    if max_sessions is not None:
-        update["max_sessions"] = max_sessions
+    update = {"access": "premium", "premium_expires": new_exp, "max_sessions": max_sessions}
     database.users.update_one({"id": int(uid)}, {"$set": update})
     return new_exp
 
@@ -268,22 +293,45 @@ def user_orders(user_id, limit=10):
     return [_strip(d) for d in rows]
 
 
-def has_access(user_row):
+def is_paid_premium(user_row):
+    """True for admins and accounts with an active paid/premium grant."""
     if not user_row:
         return False
-    if user_row["is_admin"]:
+    if user_row.get("is_admin"):
         return True
-    if user_row["access"] == "premium":
+    if user_row.get("access") == "premium":
         exp = user_row.get("premium_expires")
         if not exp:
-            return True  # permanent grant (e.g. set by an admin with no expiry)
-        return datetime.fromisoformat(exp) > datetime.now(timezone.utc).replace(tzinfo=None)
-    if user_row["access"] == "trial":
-        exp = user_row["trial_expires"]
-        if not exp:
-            return False
-        return datetime.fromisoformat(exp) > datetime.now(timezone.utc).replace(tzinfo=None)
+            return True
+        try:
+            return datetime.fromisoformat(exp) > datetime.now(timezone.utc).replace(tzinfo=None)
+        except Exception:
+            return True
     return False
+
+
+def effective_max_sessions(user_row):
+    """Free users are strictly capped at 1 session.
+    Paid/premium users and admins get unlimited sessions (None)."""
+    if not user_row:
+        return 0
+    if is_paid_premium(user_row):
+        return None
+    if user_row.get("access") == "none":
+        return 0
+    return 1
+
+
+def has_access(user_row):
+    """API keys and free accounts do not expire over time.
+    Only accounts explicitly disabled by admin (access == 'none') are blocked."""
+    if not user_row:
+        return False
+    if user_row.get("is_admin"):
+        return True
+    if user_row.get("access") == "none":
+        return False
+    return True
 
 
 # ───────────────────────── sessions ─────────────────────────
@@ -491,8 +539,9 @@ def get_api_key_by_hash(key_hash):
         "username": user["username"],
         "is_admin": user["is_admin"],
         "access": user["access"],
-        "max_sessions": user["max_sessions"],
-        "trial_expires": user["trial_expires"],
+        "max_sessions": user.get("max_sessions"),
+        "trial_expires": user.get("trial_expires"),
+        "premium_expires": user.get("premium_expires"),
     })
     return merged
 
