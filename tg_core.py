@@ -41,6 +41,10 @@ from telethon.tl.functions.account import (
     SendChangePhoneCodeRequest, ChangePhoneRequest
 )
 try:
+    from telethon.tl.functions.auth import ResendCodeRequest
+except ImportError:
+    ResendCodeRequest = None
+try:
     from telethon.tl.functions.account import SendVerifyEmailCodeRequest, VerifyEmailRequest
 except ImportError:
     SendVerifyEmailCodeRequest = None
@@ -2192,17 +2196,34 @@ def _normalize_phone(phone: str) -> str:
     return cleaned
 
 
-def _delivery_label(sent) -> str:
-    t = str(getattr(getattr(sent, "type", None), "__class__", "") or getattr(sent, "type", "")).lower()
-    if "app" in t:
-        return "Telegram app"
-    if "sms" in t:
-        return "SMS"
-    if "call" in t:
-        return "Phone call"
-    if "email" in t:
+def _sent_type_label(code_type) -> str:
+    if code_type is None:
+        return ""
+    cname = code_type.__class__.__name__.lower()
+    if "firebasesms" in cname:
+        return "Firebase SMS"
+    if "fragmentsms" in cname:
+        return "Fragment SMS"
+    if "setupemailrequired" in cname:
+        return "Login email required"
+    if "missedcall" in cname:
+        return "Missed call"
+    if "flashcall" in cname:
+        return "Flash call"
+    if "email" in cname:
         return "Email"
-    return "Telegram"
+    if "app" in cname:
+        return "Telegram app"
+    if "smsword" in cname or "smsphrase" in cname or "typesms" in cname:
+        return "SMS"
+    if "call" in cname:
+        return "Phone call"
+    return code_type.__class__.__name__
+
+
+def _delivery_label(sent) -> str:
+    label = _sent_type_label(getattr(sent, "type", None))
+    return label or "Telegram"
 
 
 def start_phone_login(phone: str):
@@ -2377,18 +2398,55 @@ def start_change_phone(session_row, new_phone: str):
                 sent = await cl(SendChangePhoneCodeRequest(
                     phone_number=clean_phone,
                     settings=CodeSettings(
-                        allow_flashcall=False,
+                        allow_flashcall=True,
                         current_number=False,
                         allow_app_hash=False,
                     ),
                 ))
+                raw_type = getattr(getattr(sent, "type", None), "__class__", type(None)).__name__
+                # If Telegram returned FirebaseSms (which a server cannot attest via Play Integrity),
+                # immediately request fallback delivery (SMS / Phone Call) via ResendCodeRequest if available.
+                if "FirebaseSms" in raw_type and ResendCodeRequest is not None and getattr(sent, "next_type", None) is not None:
+                    try:
+                        sent = await cl(ResendCodeRequest(
+                            phone_number=clean_phone,
+                            phone_code_hash=sent.phone_code_hash,
+                        ))
+                        raw_type = getattr(getattr(sent, "type", None), "__class__", type(None)).__name__
+                    except Exception:
+                        pass
+
+                if "SetUpEmailRequired" in raw_type:
+                    raise ValueError(
+                        "Telegram requires setting a Login Email first (Privacy & Security > Two-Step Verification) before sending OTP to this number."
+                    )
+                if "FirebaseSms" in raw_type:
+                    raise ValueError(
+                        "Telegram refused SMS delivery for this number (Firebase Play Integrity verification required by Telegram). "
+                        "Try another number, set a Login Email first, or change this number from the official Telegram app."
+                    )
+
+                code_hash = getattr(sent, "phone_code_hash", None)
+                if not code_hash:
+                    raise ValueError("Telegram did not return a verification hash for this number.")
+
                 delivery = _delivery_label(sent)
+                next_delivery = _sent_type_label(getattr(sent, "next_type", None))
+                timeout_s = int(getattr(sent, "timeout", 60) or 60)
+                if delivery == "Telegram app":
+                    msg = f"Telegram sent the OTP inside the Telegram app on {clean_phone}."
+                    if next_delivery:
+                        msg += f" If not received, tap Resend after {timeout_s}s for {next_delivery}."
+                else:
+                    msg = f"Telegram dispatched OTP to {clean_phone} via {delivery}."
                 return {
                     "phone": clean_phone,
-                    "phone_code_hash": sent.phone_code_hash,
+                    "phone_code_hash": code_hash,
                     "delivery": delivery,
-                    "timeout": int(getattr(sent, "timeout", 60) or 60),
-                    "message": f"Telegram sent an OTP to {clean_phone} via {delivery}.",
+                    "raw_type": raw_type,
+                    "next_delivery": next_delivery,
+                    "timeout": timeout_s,
+                    "message": msg,
                 }
             except ValueError:
                 raise
@@ -2442,6 +2500,83 @@ def start_change_phone(session_row, new_phone: str):
         if "Cancelled" in exc.__class__.__name__:
             raise RuntimeError("Telegram connection was interrupted while sending OTP. Please try again.")
         raise RuntimeError(str(exc) or exc.__class__.__name__ or "Could not initiate phone number change.")
+
+
+@_serialized_telegram
+def resend_change_phone(session_row, new_phone: str, phone_code_hash: str):
+    """Ask Telegram to resend the change-phone OTP via its next fallback delivery method (e.g. SMS or Call)."""
+    if ResendCodeRequest is None:
+        raise ValueError("Telegram resend endpoint is unavailable on this server build.")
+    clean_phone = _normalize_phone(new_phone)
+    clean_hash = (phone_code_hash or "").strip()
+    if not clean_hash:
+        raise ValueError("Missing verification token. Please request a fresh OTP first.")
+    drop_client(session_row["id"])
+
+    async def _f():
+        for attempt in range(2):
+            cl = None
+            try:
+                cl = await _open_fresh_authorized_client(session_row)
+                sent = await cl(ResendCodeRequest(
+                    phone_number=clean_phone,
+                    phone_code_hash=clean_hash,
+                ))
+                raw_type = getattr(getattr(sent, "type", None), "__class__", type(None)).__name__
+                if "FirebaseSms" in raw_type:
+                    raise ValueError(
+                        "Telegram still requires Firebase Play Integrity verification for this number. Please try another number or use the official Telegram app."
+                    )
+                delivery = _delivery_label(sent)
+                next_delivery = _sent_type_label(getattr(sent, "next_type", None))
+                timeout_s = int(getattr(sent, "timeout", 60) or 60)
+                return {
+                    "phone": clean_phone,
+                    "phone_code_hash": getattr(sent, "phone_code_hash", clean_hash) or clean_hash,
+                    "delivery": delivery,
+                    "raw_type": raw_type,
+                    "next_delivery": next_delivery,
+                    "timeout": timeout_s,
+                    "message": f"Telegram resent OTP to {clean_phone} via {delivery}.",
+                }
+            except ValueError:
+                raise
+            except FloodWaitError as fw:
+                raise ValueError(f"Please wait {fw.seconds} seconds before resending OTP.")
+            except asyncio.CancelledError:
+                if attempt == 0:
+                    await asyncio.sleep(0.35)
+                    continue
+                raise RuntimeError("Telegram connection was interrupted while resending OTP. Please try again.")
+            except (ConnectionError, OSError, TimeoutError):
+                if attempt == 0:
+                    await asyncio.sleep(0.35)
+                    continue
+                raise RuntimeError("Telegram network connection dropped. Please try again.")
+            except Exception as e:
+                msg = str(e)
+                up = msg.upper()
+                if "SEND_CODE_UNAVAILABLE" in up:
+                    raise ValueError("No more fallback OTP delivery methods are available for this number right now. Please wait a few minutes and try again.")
+                if "PHONE_CODE_EXPIRED" in up:
+                    raise ValueError("Verification session expired. Tap Edit Number and request a fresh OTP.")
+                raise ValueError(msg or e.__class__.__name__ or "Could not resend OTP.")
+            finally:
+                if cl is not None:
+                    try:
+                        await cl.disconnect()
+                    except Exception:
+                        pass
+        raise RuntimeError("Could not resend OTP. Please try again.")
+
+    try:
+        return run_async(_f())
+    except BaseException as exc:
+        if isinstance(exc, (ValueError, RuntimeError)):
+            raise
+        if "Cancelled" in exc.__class__.__name__:
+            raise RuntimeError("Telegram connection was interrupted while resending OTP. Please try again.")
+        raise RuntimeError(str(exc) or exc.__class__.__name__ or "Could not resend OTP.")
 
 
 @_serialized_telegram

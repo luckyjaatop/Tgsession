@@ -1784,6 +1784,38 @@ def api_phone_change_start(session_id):
     return jsonify({"ok": False, "error": msg}), 500
 
 
+@app.route("/api/v1/sessions/<int:session_id>/phone/change/resend", methods=["POST"])
+def api_phone_change_resend(session_id):
+    u, err = api_user()
+    if err: return err
+    row = api_owned_session(u, session_id)
+    if not row: return jsonify({"ok": False, "error": "Session not found."}), 404
+
+    data = request.get_json(silent=True) or {}
+    phone = (data.get("phone") or "").strip()
+    phone_code_hash = (data.get("phone_code_hash") or "").strip()
+    if not phone or not phone_code_hash:
+        return jsonify({"ok": False, "error": "Provide 'phone' and 'phone_code_hash'."}), 400
+    last = None
+    for attempt in range(2):
+        try:
+            res = tg_core.resend_change_phone(row, phone, phone_code_hash)
+            return jsonify({"ok": True, **res})
+        except ValueError as ve:
+            return jsonify({"ok": False, "error": str(ve)}), 400
+        except Exception as e:
+            last = e
+            if attempt == 0:
+                time.sleep(0.35)
+    e = last or RuntimeError("Could not resend phone change OTP.")
+    msg = str(e) or (
+        "Telegram connection was interrupted while resending OTP. Please try again."
+        if "Cancelled" in e.__class__.__name__
+        else e.__class__.__name__
+    )
+    return jsonify({"ok": False, "error": msg}), 500
+
+
 @app.route("/api/v1/sessions/<int:session_id>/phone/change/confirm", methods=["POST"])
 def api_phone_change_confirm(session_id):
     u, err = api_user()
